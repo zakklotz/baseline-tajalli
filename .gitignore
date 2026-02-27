@@ -1,0 +1,103 @@
+
+---
+
+### 6) `.gitignore`  *(add or update)*
+This is a good baseline. It **does not ignore** `.nn-core/`, `.baseline-transformer/`, `.tajalli_deprecated/` (since you said they’re in-repo for reference).
+
+```gitignore
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+dist/
+.eggs/
+*.egg-info/
+*.egg
+MANIFEST
+
+# Unit test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+
+# Type checkers
+.mypy_cache/
+.pyre/
+.pytype/
+
+# =========================
+# Virtual environments
+# =========================
+.venv/
+venv/
+env/
+ENV/
+
+# =========================
+# IDE / Editor
+# =========================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# =========================
+# OS
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# Logs / outputs
+# =========================
+*.log
+logs/
+
+# =========================
+# Training artifacts
+# =========================
+runs/
+checkpoints/
+outputs/
+experiments/
+wandb/
+tensorboard/
+tb_logs/
+
+# Large model files
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.safetensors
+
+# =========================
+# Data
+# =========================
+data/
+datasets/
+*.parquet
+*.arrow
+*.h5
+*.hdf5
+
+# =========================
+# Temporary files
+# =========================
+tmp/
+temp/
+*.tmp
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
