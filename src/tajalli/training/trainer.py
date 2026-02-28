@@ -15,7 +15,6 @@ from tqdm import tqdm
 from .scheduler import get_cosine_warmup_scheduler, get_multistep_lr_scheduler
 from .losses import pair_orthogonality_loss, pair_coverage_loss
 from ..model.diverse_moe import DiverseAsmaaMoE, RandomAssignMoE, TwoPhaseMoE
-from ..model.ayan_moe import AyanThābitahMoE
 
 
 def _get_param_groups_decay_no_decay(
@@ -932,10 +931,7 @@ class Phase2DiverseTrainer(Phase2Trainer):
             moe_aux = step_metrics.get("moe_aux") if step_metrics else None
             if moe_aux is not None:
                 scale = _diversity_scale(step, self.diversity_warmup, self.diversity_ramp)
-                if isinstance(moe, AyanThābitahMoE):
-                    if "entropy_loss" in moe_aux and self.lambda_entropy != 0:
-                        total_loss = total_loss + (self.lambda_entropy * moe_aux["entropy_loss"]) / self.grad_accum
-                elif isinstance(moe, RandomAssignMoE):
+                if isinstance(moe, RandomAssignMoE):
                     if "ortho_loss" in moe_aux and scale > 0:
                         total_loss = total_loss + (scale * self.lambda_ortho * moe_aux["ortho_loss"]) / self.grad_accum
                 elif isinstance(moe, TwoPhaseMoE):
@@ -984,96 +980,89 @@ class Phase2DiverseTrainer(Phase2Trainer):
                 if isinstance(v, (int, float)):
                     result[k] = v
             if moe_aux is not None:
-                if isinstance(moe, AyanThābitahMoE):
-                    if "entropy_loss" in moe_aux:
-                        result["entropy_loss"] = moe_aux["entropy_loss"].item()
-                    if "archetype_weights" in moe_aux:
-                        aw = moe_aux["archetype_weights"]
-                        result["archetype_weights"] = aw.mean(dim=(0, 1)).cpu()
+                result["load_balance_loss"] = moe_aux["load_balance_loss"].item() if hasattr(moe_aux["load_balance_loss"], "item") else float(moe_aux["load_balance_loss"])
+                if "entropy_loss" in moe_aux:
+                    result["entropy_loss"] = moe_aux["entropy_loss"].item()
+                if "ortho_loss" in moe_aux:
+                    result["ortho_loss"] = moe_aux["ortho_loss"].item()
+                if "expert_outputs_subset" in moe_aux and self._pair_loss_scale(step) > 0:
+                    with torch.no_grad():
+                        result["pair_ortho_loss"] = pair_orthogonality_loss(moe_aux["expert_outputs_subset"]).item()
+                idx = moe_aux["expert_indices"]
+                probs = moe_aux["router_probs"]
+                # expert_indices is (B, T, K) with K=2 (token-choice) or 14 (expert-choice); use idx for B,T
+                if idx.dim() == 3:
+                    B, T = idx.shape[0], idx.shape[1]
                 else:
-                    result["load_balance_loss"] = moe_aux["load_balance_loss"].item() if hasattr(moe_aux["load_balance_loss"], "item") else float(moe_aux["load_balance_loss"])
-                    if "entropy_loss" in moe_aux:
-                        result["entropy_loss"] = moe_aux["entropy_loss"].item()
-                    if "ortho_loss" in moe_aux:
-                        result["ortho_loss"] = moe_aux["ortho_loss"].item()
-                    if "expert_outputs_subset" in moe_aux and self._pair_loss_scale(step) > 0:
-                        with torch.no_grad():
-                            result["pair_ortho_loss"] = pair_orthogonality_loss(moe_aux["expert_outputs_subset"]).item()
-                    idx = moe_aux["expert_indices"]
-                    probs = moe_aux["router_probs"]
-                    # expert_indices is (B, T, K) with K=2 (token-choice) or 14 (expert-choice); use idx for B,T
-                    if idx.dim() == 3:
-                        B, T = idx.shape[0], idx.shape[1]
-                    else:
-                        B, T = probs.shape[0], probs.shape[1]
-                    if idx.dim() == 3 and idx.shape[-1] == 14:
-                        expert_freq = idx.sum(dim=(0, 1))
-                        expert_freq = expert_freq / (expert_freq.sum() + 1e-10)
-                        result["top1_expert_share"] = expert_freq.max().item()
-                        result["min_expert_share"] = expert_freq.min().item()
-                        p = expert_freq + 1e-10
-                        result["utilization_entropy"] = -(p * p.log()).sum().item()
-                        coact = torch.zeros(14, 14, device=idx.device)
+                    B, T = probs.shape[0], probs.shape[1]
+                if idx.dim() == 3 and idx.shape[-1] == 14:
+                    expert_freq = idx.sum(dim=(0, 1))
+                    expert_freq = expert_freq / (expert_freq.sum() + 1e-10)
+                    result["top1_expert_share"] = expert_freq.max().item()
+                    result["min_expert_share"] = expert_freq.min().item()
+                    p = expert_freq + 1e-10
+                    result["utilization_entropy"] = -(p * p.log()).sum().item()
+                    coact = torch.zeros(14, 14, device=idx.device)
+                    for b in range(B):
+                        for t in range(T):
+                            contrib = (idx[b, t] > 1e-6).nonzero(as_tuple=True)[0]
+                            for i in contrib:
+                                for j in contrib:
+                                    coact[i, j] += 1
+                    result["coactivation_matrix"] = coact.cpu().float()
+                    if "pair_activation_stats" in moe_aux:
+                        result["pair_activation_stats"] = moe_aux["pair_activation_stats"].cpu()
+                else:
+                    K = idx.shape[-1]
+                    expert_freq = torch.zeros(14, device=idx.device)
+                    for e in range(14):
+                        expert_freq[e] = (idx == e).float().sum()
+                    expert_freq = expert_freq / (B * T * K + 1e-10)
+                    result["top1_expert_share"] = expert_freq.max().item()
+                    result["min_expert_share"] = expert_freq.min().item()
+                    p = expert_freq + 1e-10
+                    result["utilization_entropy"] = -(p * p.log()).sum().item()
+                    coact = torch.zeros(14, 14, device=idx.device)
+                    if K >= 2:
                         for b in range(B):
                             for t in range(T):
-                                contrib = (idx[b, t] > 1e-6).nonzero(as_tuple=True)[0]
-                                for i in contrib:
-                                    for j in contrib:
-                                        coact[i, j] += 1
-                        result["coactivation_matrix"] = coact.cpu().float()
-                        if "pair_activation_stats" in moe_aux:
-                            result["pair_activation_stats"] = moe_aux["pair_activation_stats"].cpu()
-                    else:
-                        K = idx.shape[-1]
-                        expert_freq = torch.zeros(14, device=idx.device)
+                                i, j = idx[b, t, 0].item(), idx[b, t, 1].item()
+                                coact[i, j] += 1
+                                coact[j, i] += 1
+                    result["coactivation_matrix"] = coact.cpu().float()
+                    if step == 4999 and K >= 2:
+                        result["expert_freq_full"] = expert_freq.cpu().tolist()
+                    if "phase" in moe_aux:
+                        result["phase"] = moe_aux["phase"]
+                    if step == 9999 and K == 1:
+                        result["expert_freq_full"] = expert_freq.cpu().tolist()
+                    if "router_weights" in moe_aux and "expert_out_norms" in moe_aux:
+                        rw = moe_aux["router_weights"]
+                        asn = idx.reshape(-1)
+                        expert_avg_weight = torch.zeros(14, device=idx.device)
                         for e in range(14):
-                            expert_freq[e] = (idx == e).float().sum()
-                        expert_freq = expert_freq / (B * T * K + 1e-10)
-                        result["top1_expert_share"] = expert_freq.max().item()
-                        result["min_expert_share"] = expert_freq.min().item()
-                        p = expert_freq + 1e-10
-                        result["utilization_entropy"] = -(p * p.log()).sum().item()
-                        coact = torch.zeros(14, 14, device=idx.device)
-                        if K >= 2:
-                            for b in range(B):
-                                for t in range(T):
-                                    i, j = idx[b, t, 0].item(), idx[b, t, 1].item()
-                                    coact[i, j] += 1
-                                    coact[j, i] += 1
-                        result["coactivation_matrix"] = coact.cpu().float()
-                        if step == 4999 and K >= 2:
-                            result["expert_freq_full"] = expert_freq.cpu().tolist()
-                        if "phase" in moe_aux:
-                            result["phase"] = moe_aux["phase"]
-                        if step == 9999 and K == 1:
-                            result["expert_freq_full"] = expert_freq.cpu().tolist()
-                        if "router_weights" in moe_aux and "expert_out_norms" in moe_aux:
-                            rw = moe_aux["router_weights"]
-                            asn = idx.reshape(-1)
-                            expert_avg_weight = torch.zeros(14, device=idx.device)
-                            for e in range(14):
-                                m = asn == e
-                                if m.any():
-                                    expert_avg_weight[e] = rw[m].float().mean()
-                            result["expert_avg_weight"] = expert_avg_weight.cpu()
-                            result["expert_out_norms"] = moe_aux["expert_out_norms"].cpu()
-                        if isinstance(moe, TwoPhaseMoE) and moe_aux.get("phase") == "B" and hasattr(self, "_rescue_consecutive_below"):
-                            for e in range(14):
-                                f = expert_freq[e].item()
-                                if f < 0.02:
-                                    self._rescue_consecutive_below[e] += 1
-                                else:
-                                    self._rescue_consecutive_below[e] = 0
-                                if self._rescue_consecutive_below[e] >= 500:
-                                    self._rescue_steps_remaining[e] = 200
-                                    self._rescue_consecutive_below[e] = 0
-                                    print(f"Rescue routing: expert {e} triggered at step {step} (was <2% for 500 steps), routing 5% of tokens for 200 steps")
-                            for e in self._rescue_experts_this_step:
-                                self._rescue_steps_remaining[e] = max(0, self._rescue_steps_remaining[e] - 1)
-                    pr = moe_aux.get("router_probs")
-                    if pr is not None and pr.dim() == 2:
-                        p_soft = torch.softmax(pr, dim=-1)
-                        result["router_entropy"] = -(p_soft * (p_soft + 1e-10).log()).sum(dim=-1).mean().item()
+                            m = asn == e
+                            if m.any():
+                                expert_avg_weight[e] = rw[m].float().mean()
+                        result["expert_avg_weight"] = expert_avg_weight.cpu()
+                        result["expert_out_norms"] = moe_aux["expert_out_norms"].cpu()
+                    if isinstance(moe, TwoPhaseMoE) and moe_aux.get("phase") == "B" and hasattr(self, "_rescue_consecutive_below"):
+                        for e in range(14):
+                            f = expert_freq[e].item()
+                            if f < 0.02:
+                                self._rescue_consecutive_below[e] += 1
+                            else:
+                                self._rescue_consecutive_below[e] = 0
+                            if self._rescue_consecutive_below[e] >= 500:
+                                self._rescue_steps_remaining[e] = 200
+                                self._rescue_consecutive_below[e] = 0
+                                print(f"Rescue routing: expert {e} triggered at step {step} (was <2% for 500 steps), routing 5% of tokens for 200 steps")
+                        for e in self._rescue_experts_this_step:
+                            self._rescue_steps_remaining[e] = max(0, self._rescue_steps_remaining[e] - 1)
+                pr = moe_aux.get("router_probs")
+                if pr is not None and pr.dim() == 2:
+                    p_soft = torch.softmax(pr, dim=-1)
+                    result["router_entropy"] = -(p_soft * (p_soft + 1e-10).log()).sum(dim=-1).mean().item()
         return result
 
     def train(self):

@@ -432,8 +432,6 @@ class TajalliStack(nn.Module):
         ortho_subset_frac: float = 0.1,
         lawh_cross_attn: Optional["LawhCrossAttention"] = None,
         lawh_at_steps: Optional[List[int]] = None,
-        use_jamba: bool = False,
-        jamba_config: Optional[dict] = None,
         n_experts: int = 14,
         n_attributes: int = N_ATTRIBUTES,
         d_attr_hidden: Optional[int] = None,
@@ -478,37 +476,12 @@ class TajalliStack(nn.Module):
                 n_experts=n_experts,
                 expert_choice_routing=expert_choice_routing,
             )
-        if use_jamba and jamba_config:
-            from .jamba_adapter import JambaStyleBlock
-            from .tajalli_block_v2 import TajalliBlockV2
-            jamba_block = JambaStyleBlock(
-                d_model=d_model,
-                n_heads=n_heads,
-                d_head=d_head,
-                d_ff=d_ff,
-                dropout=dropout,
-                max_seq_len=max_seq_len,
-                ortho_subset_frac=ortho_subset_frac,
-                mamba_d_state=jamba_config.get("mamba_d_state", 16),
-                mamba_dt_rank=jamba_config.get("mamba_dt_rank", 32),
-                mamba_expand=jamba_config.get("mamba_expand", 2),
-                mamba_d_conv=jamba_config.get("mamba_d_conv", 4),
-            )
-            self.block = TajalliBlockV2(
-                d_model, d_essence, n_heads, d_head, d_ff,
-                dropout, max_seq_len, moe_layer=None,
-                lawh_cross_attn=lawh_cross_attn,
-                jamba_block=jamba_block,
-                use_jamba=True,
-                **tajalli_kw,
-            )
-        else:
-            self.block = TajalliBlock(
-                d_model, d_essence, n_heads, d_head, d_ff,
-                dropout, max_seq_len, moe_layer=moe_layer,
-                lawh_cross_attn=lawh_cross_attn,
-                **tajalli_kw,
-            )
+        self.block = TajalliBlock(
+            d_model, d_essence, n_heads, d_head, d_ff,
+            dropout, max_seq_len, moe_layer=moe_layer,
+            lawh_cross_attn=lawh_cross_attn,
+            **tajalli_kw,
+        )
 
     def forward(
         self,
