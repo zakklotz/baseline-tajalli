@@ -1,7 +1,6 @@
 """Model components for Tajallī architecture."""
 
 from .essence import EssenceCore, EssenceCoreMatrix
-from .attention import MultiHeadAttention, apply_rope, FeedForward
 from .tajalli import TajalliLayer, TajalliBlock, TajalliStack
 from .tajalli_model import TajalliModelPhase1, TajalliModelPhase2, TajalliModelPhase3
 from .moe import PairedMoELayer, WisdomRouter, N_EXPERTS, N_PAIRS, NAME_PAIRS
@@ -14,9 +13,6 @@ from .qadr import QadrConstraints
 __all__ = [
     "EssenceCore",
     "EssenceCoreMatrix",
-    "MultiHeadAttention",
-    "apply_rope",
-    "FeedForward",
     "TajalliLayer",
     "TajalliBlock",
     "TajalliStack",
