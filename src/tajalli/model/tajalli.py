@@ -5,7 +5,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Literal, Optional, TYPE_CHECKING, List
 
-from .attention import MultiHeadAttention, FeedForward
+from .attention import MultiHeadAttention  # keep attention for now
+from tajalli.nncore_mlp import TajalliFFN, build_norm
+
 
 if TYPE_CHECKING:
     from .moe import PairedMoELayer
@@ -280,9 +282,9 @@ class TajalliBlock(nn.Module):
         )
         self.lawh_cross_attn = lawh_cross_attn
         self.moe_layer = moe_layer
-        self.ffn = FeedForward(d_model, d_ff, dropout) if moe_layer is None else None
-        self.norm_attn = nn.LayerNorm(d_model)
-        self.norm_ffn = nn.LayerNorm(d_model)
+        self.ffn = TajalliFFN(d_model=d_model, d_ff=d_ff, dropout=dropout) if moe_layer is None else None
+        self.norm_attn = build_norm("layernorm", d_model)
+        self.norm_ffn = build_norm("layernorm", d_model)
         # Extra transformer blocks per recursive step — unique weights, shared across steps.
         # Each adds one full attention+FFN pass, doubling compute per step when n_inner_layers=1.
         self.inner_attns = nn.ModuleList([
@@ -290,11 +292,11 @@ class TajalliBlock(nn.Module):
             for _ in range(n_inner_layers)
         ])
         self.inner_ffns = nn.ModuleList([
-            FeedForward(d_model, d_ff, dropout)
+            TajalliFFN(d_model=d_model, d_ff=d_ff, dropout=dropout)
             for _ in range(n_inner_layers)
         ])
-        self.inner_norms_attn = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(n_inner_layers)])
-        self.inner_norms_ffn = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(n_inner_layers)])
+        self.inner_norms_attn = nn.ModuleList([build_norm("layernorm", d_model) for _ in range(n_inner_layers)])
+        self.inner_norms_ffn = nn.ModuleList([build_norm("layernorm", d_model) for _ in range(n_inner_layers)])
 
     def forward(
         self,

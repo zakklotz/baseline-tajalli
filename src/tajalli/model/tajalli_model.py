@@ -12,7 +12,7 @@ from .lawh import LawhMemoryStore, LawhCrossAttention
 from .exit_router import ExitRouter
 from .barzakh import BarzakhBottleneck
 from .qadr import QadrConstraints
-
+from tajalli.nncore_mlp import build_norm
 
 class TajalliModelPhase1(nn.Module):
     """
@@ -528,7 +528,7 @@ class TajalliModelPhase3(nn.Module):
             **tajalli_kw,
         )
         self.barzakh = BarzakhBottleneck(d_model=d_model, d_barzakh=d_barzakh)
-        self.final_norm = nn.LayerNorm(d_model)
+        self.final_norm = build_norm("layernorm", d_model)
         self.qadr = QadrConstraints(
             repetition_penalty=qadr_repetition_penalty,
             temperature=qadr_temperature,

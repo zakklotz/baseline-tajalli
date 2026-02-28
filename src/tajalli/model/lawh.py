@@ -12,6 +12,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from tajalli.nncore_mlp import build_norm
+
 
 class LawhMemoryStore(nn.Module):
     """
@@ -125,7 +127,7 @@ class LawhCrossAttention(nn.Module):
         self.query_proj = nn.Linear(d_model, d_key)
         # Always use out_proj so we can zero-init it; at init residual is 0 (avoids Phase 3 loss spike)
         self.out_proj = nn.Linear(d_value, d_model)
-        self.norm = nn.LayerNorm(d_model)
+        self.norm = build_norm("layernorm", d_model)
         self.dropout = nn.Dropout(dropout)
         nn.init.zeros_(self.query_proj.weight)
         nn.init.zeros_(self.query_proj.bias)
