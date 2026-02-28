@@ -523,8 +523,6 @@ class TajalliModelPhase3(nn.Module):
             ortho_subset_frac=ortho_subset_frac,
             lawh_cross_attn=lawh_cross_attn,
             lawh_at_steps=lawh_at_steps,
-            use_jamba=use_jamba,
-            jamba_config=jamba_config,
             **tajalli_kw,
         )
         self.barzakh = BarzakhBottleneck(d_model=d_model, d_barzakh=d_barzakh)
