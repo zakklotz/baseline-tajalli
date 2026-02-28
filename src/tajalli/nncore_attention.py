@@ -193,21 +193,39 @@ class TajalliAttention(nn.Module):
         x: torch.Tensor,
         context: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        *,
+        memory_h: Optional[torch.Tensor] = None,
+        mem_pos_start: int = 0,
+        cached_kv: Optional[object] = None,
+        return_kv: bool = False,
+        **kwargs,
+    ):
         """
-        x: (B, T, C)
-        context: optional cross-attention source (B, S, C)
+        Compatibility layer with legacy Tajalli MultiHeadAttention API.
+
+        nn-core attention does not (currently) support Tajalli's recursive memory/cache
+        interface. For now:
+          - memory_h is ignored (reserved for later integration)
+          - mem_pos_start is ignored
+          - cached_kv is ignored
+          - if return_kv=True, we return (out, None) so callers expecting a tuple don't break
         """
+        # Self-attention
         if context is None:
-            return self._call_attn(
+            out = self._call_attn(
                 x, x, x,
                 is_causal=self.causal,
                 attn_mask=attn_mask,
             )
+        else:
+            # Cross-attention: causal False
+            out = self._call_attn(
+                x, context, context,
+                is_causal=False,
+                attn_mask=attn_mask,
+            )
 
-        # Cross-attention: causal should be False
-        return self._call_attn(
-            x, context, context,
-            is_causal=False,
-            attn_mask=attn_mask,
-        )
+        if return_kv:
+            return out, None
+
+        return out

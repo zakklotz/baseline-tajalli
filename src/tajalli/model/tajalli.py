@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Literal, Optional, TYPE_CHECKING, List
 
-from .attention import MultiHeadAttention  # keep attention for now
+from tajalli.nncore_attention import TajalliAttention as MultiHeadAttention
 from tajalli.nncore_mlp import TajalliFFN, build_norm
 
 
