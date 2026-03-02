@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Dict, Protocol, runtime_checkable
 
 import torch
 
@@ -12,35 +12,32 @@ class LanguageModel(Protocol):
 
 def extract_logits(model_out: Any) -> torch.Tensor:
     """
-    Normalize different model output conventions into logits tensor.
+    Normalize different model output formats into logits tensor (B, T, V).
 
     Supported:
-      - torch.Tensor -> logits
-      - (logits, ...) tuple/list -> logits is [0]
-      - {"logits": logits, ...} dict -> logits
-      - {"y": logits, ...} dict -> logits (common alt)
+      - torch.Tensor
+      - {"logits": tensor} / {"lm_logits": tensor} / {"out": tensor}
+      - objects with .logits
+      - (logits, *rest)
     """
     if isinstance(model_out, torch.Tensor):
         return model_out
 
-    if isinstance(model_out, (tuple, list)) and len(model_out) > 0:
+    if isinstance(model_out, tuple) and len(model_out) >= 1:
         first = model_out[0]
         if isinstance(first, torch.Tensor):
             return first
+        if isinstance(first, dict):
+            model_out = first  # fall through to dict case
 
     if isinstance(model_out, dict):
-        for key in ("logits", "y", "output", "out"):
-            if key in model_out and isinstance(model_out[key], torch.Tensor):
-                return model_out[key]
-        # Sometimes nested: {"model": {"logits": ...}}
-        if "model" in model_out and isinstance(model_out["model"], dict):
-            inner = model_out["model"]
-            if "logits" in inner and isinstance(inner["logits"], torch.Tensor):
-                return inner["logits"]
+        d: Dict[str, Any] = model_out
+        for key in ("logits", "lm_logits", "out"):
+            if key in d and isinstance(d[key], torch.Tensor):
+                return d[key]
+        raise KeyError(f"Dict output missing logits-like key. Keys={list(d.keys())}")
 
-        raise TypeError(
-            f"Dict output did not contain a tensor logits under keys "
-            f"('logits','y','output','out'). Keys={list(model_out.keys())}"
-        )
+    if hasattr(model_out, "logits") and isinstance(model_out.logits, torch.Tensor):
+        return model_out.logits
 
-    raise TypeError(f"Expected logits as torch.Tensor/tuple/list/dict, got {type(model_out)}")
+    raise TypeError(f"Expected logits as torch.Tensor / dict / tuple / .logits, got {type(model_out)}")

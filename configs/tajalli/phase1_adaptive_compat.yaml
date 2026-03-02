@@ -1,0 +1,80 @@
+run_name: tajalli_phase1_wt103_300k
+
+# Data
+cache_dir: data/cache
+batch_size: 1
+seq_len: 512
+num_workers: 2
+pin_memory: true
+persistent_workers: true
+seed: 1337
+
+# Train length
+max_steps: 300000
+gradient_accumulation_steps: 32  # effective batch = batch_size * grad_accum
+eval_every: 2000
+checkpoint_every: 5000
+
+# Optim
+optimizer: adamw
+lr: 6.0e-4
+lr_final: 1.0e-5
+lr_schedule: cosine_with_warmup
+warmup_steps: 1000
+weight_decay: 0.10
+grad_clip: 1.0
+
+# If your trainer uses min_lr_ratio instead of lr_final, keep this consistent:
+# min_lr_ratio = lr_final / lr = 1e-5 / 6e-4 = 0.016666...
+min_lr_ratio: 0.0166667
+
+# Precision / device
+device: cuda
+dtype: bf16    # falls back safely if bf16 not available on your setup
+amp: true
+
+# Model (Phase1 adaptive parity)
+d_model: 768
+n_heads: 12
+d_head: 64
+d_ff: 3072
+d_essence: 1536
+
+# Recursion / depth
+# Some codepaths expect n_steps, others expect recursive_steps — include BOTH for safety.
+n_steps: 8
+recursive_steps: 8
+
+n_inner_layers: 3
+dropout: 0.0
+max_seq_len: 512
+
+# Variable depth training (Phase1 behavior)
+variable_depth_training: true
+depth_min: 6
+depth_max: 10
+
+# Gate collapse prevention (critical)
+lambda_gate_entropy: 0.1
+
+# Optional Phase1-ish extras (safe if ignored by your trainer)
+use_exit_router: true
+exit_threshold: 0.5
+exit_capacity_fraction: 0.5
+lambda_exit: 0.01
+
+use_recursive_kv_cache: true
+
+# Adaptive softmax (Phase1 used it)
+use_adaptive_softmax: true
+
+# Eval memory settings (matches what your training printout showed)
+eval_use_memory: false
+eval_seg_len: 128
+eval_mem_len: 384
+
+# Essence (Phase1 adaptive used matrix essence)
+essence_init: spectral
+essence_type: matrix
+n_essence_rows: 64
+init_std: 0.02
