@@ -128,10 +128,12 @@ class TajalliAttention(nn.Module):
         attn_mask: Optional[torch.Tensor],
         is_causal: bool,
         pos_offset: int,
+        cached_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        return_kv: bool = False,
     ) -> Any:
         """
         Call nn-core attention with best-effort signature adaptation.
-        (Your nn-core.zip uses: forward(x, context=..., attn_mask=..., key_padding_mask=..., is_causal=..., pos_offset=...))
+        Supports cached_kv and return_kv for recursive KV cache.
         """
         fwd = self.attn.forward
         sig = inspect.signature(fwd)
@@ -151,15 +153,18 @@ class TajalliAttention(nn.Module):
         kw.update(filtered_kwargs(attn_mask=attn_mask))
         kw.update(filtered_kwargs(key_padding_mask=key_padding_mask))
 
-        # causal flag name can vary
         if "is_causal" in sig.parameters:
             kw["is_causal"] = is_causal
         elif "causal" in sig.parameters:
             kw["causal"] = is_causal
 
-        # position offset for RoPE continuity
         if "pos_offset" in sig.parameters:
             kw["pos_offset"] = int(pos_offset)
+
+        if "cached_kv" in sig.parameters:
+            kw["cached_kv"] = cached_kv
+        if "return_kv" in sig.parameters:
+            kw["return_kv"] = return_kv
 
         return self.attn(x, **kw)
 
@@ -169,7 +174,7 @@ class TajalliAttention(nn.Module):
         mask: Optional[torch.Tensor] = None,
         *,
         memory_h: Optional[torch.Tensor] = None,
-        cached_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # noqa: ARG002 (legacy)
+        cached_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         mem_pos_start: int = 0,
         return_kv: bool = False,
     ):
@@ -194,6 +199,8 @@ class TajalliAttention(nn.Module):
             attn_mask=attn_mask,
             is_causal=self.causal,
             pos_offset=int(mem_pos_start),
+            cached_kv=cached_kv,
+            return_kv=return_kv,
         )
 
         # Normalize return types

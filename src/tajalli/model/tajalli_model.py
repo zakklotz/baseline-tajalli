@@ -8,6 +8,7 @@ from typing import Literal, Optional
 from .essence import EssenceCore, EssenceCoreMatrix
 from .tajalli import TajalliStack
 from .moe import N_EXPERTS  # Default n_experts; config can override
+from .adaptive_output import AdaptiveOutput
 from .lawh import LawhMemoryStore, LawhCrossAttention
 from .exit_router import ExitRouter
 from .barzakh import BarzakhBottleneck
@@ -45,6 +46,10 @@ class TajalliModelPhase1(nn.Module):
         depth_families: Optional[int] = None,
         family_steps: Optional[list] = None,
         hypernetwork_attributes: bool = False,
+        use_adaptive_softmax: bool = False,
+        freq_vocab_path: Optional[str] = None,
+        adaptive_softmax_cutoffs: Optional[list[int]] = None,
+        adaptive_softmax_div_value: float = 4.0,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -89,6 +94,40 @@ class TajalliModelPhase1(nn.Module):
             family_steps=family_steps,
             hypernetwork_attributes=hypernetwork_attributes,
         )
+
+        self.adaptive_output = None
+        self.orig_to_rank = None
+        if use_adaptive_softmax and freq_vocab_path:
+            from tajalli.data.freq_vocab import load_freq_order, orig_to_rank_from_freq_order
+
+            path = Path(freq_vocab_path)
+            if path.exists():
+                freq_order = load_freq_order(path)
+                if len(freq_order) != vocab_size:
+                    raise ValueError(
+                        f"Adaptive softmax freq_order length ({len(freq_order)}) "
+                        f"must equal vocab_size ({vocab_size})."
+                    )
+                self.orig_to_rank = orig_to_rank_from_freq_order(freq_order)
+                cutoffs = [int(cutoff) for cutoff in (adaptive_softmax_cutoffs or [20000, 40000])]
+                if any(cutoff <= 0 for cutoff in cutoffs):
+                    raise ValueError("adaptive_softmax_cutoffs must contain only positive integers.")
+                if cutoffs != sorted(set(cutoffs)):
+                    raise ValueError("adaptive_softmax_cutoffs must be strictly increasing with no duplicates.")
+                if any(cutoff >= vocab_size for cutoff in cutoffs):
+                    raise ValueError(
+                        f"adaptive_softmax_cutoffs {cutoffs} must all be < vocab_size ({vocab_size})."
+                    )
+                self.adaptive_output = AdaptiveOutput(
+                    d_model=d_model,
+                    vocab_size=vocab_size,
+                    cutoffs=cutoffs,
+                    div_value=adaptive_softmax_div_value,
+                )
+            else:
+                raise FileNotFoundError(
+                    f"freq_vocab_path {freq_vocab_path} not found; required for use_adaptive_softmax"
+                )
 
     @property
     def output_head(self) -> nn.Linear:

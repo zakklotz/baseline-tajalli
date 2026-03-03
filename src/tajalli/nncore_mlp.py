@@ -128,8 +128,7 @@ class TajalliFFN(nn.Module):
     """
     Drop-in feed-forward network wrapper for Tajalli blocks.
 
-    Internally uses an nn-core MLP/FFN implementation when available, with a
-    torch fallback only if absolutely necessary.
+    Uses nn-core build_mlp when available; default activation gelu for Phase1 alignment.
     """
 
     def __init__(
@@ -137,37 +136,48 @@ class TajalliFFN(nn.Module):
         d_model: int,
         d_ff: int,
         dropout: float = 0.0,
-        activation: str = "silu",
+        activation: str = "gelu",
         bias: bool = True,
     ):
         super().__init__()
         _require_nncore()
 
-        # Try to find a suitable nn-core FFN/MLP
-        FFNCls = _import_first([
-            ("nncore.layers.mlp", "MLP"),
-            ("nncore.layers.ffn", "FeedForward"),
-            ("nncore.layers.mlp", "FeedForward"),
-            ("nncore.layers.transformer", "FeedForward"),
-        ])
-
+        # Prefer nn-core build_mlp (Phase1 uses GELU)
         try:
-            self.ffn = _construct_ffn(
-                FFNCls,
+            build_mlp_fn = _import_first([
+                ("nncore.layers.mlp", "build_mlp"),
+                ("nncore.layers", "build_mlp"),
+            ])
+            mlp = build_mlp_fn(
                 d_model=d_model,
                 d_ff=d_ff,
-                dropout=dropout,
-                bias=bias,
-                activation=activation,
+                activation=activation.lower(),
+                dropout_p=dropout,
             )
-        except Exception:
-            # Last resort fallback (should rarely happen)
-            self.ffn = nn.Sequential(
-                nn.Linear(d_model, d_ff, bias=bias),
-                nn.SiLU() if activation.lower() in ("silu", "swish") else nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(d_ff, d_model, bias=bias),
-            )
+            self.ffn = nn.Sequential(mlp, nn.Dropout(dropout)) if dropout > 0 else mlp
+        except (ImportError, TypeError, AttributeError):
+            FFNCls = _import_first([
+                ("nncore.layers.mlp", "MLP"),
+                ("nncore.layers.ffn", "FeedForward"),
+                ("nncore.layers.mlp", "FeedForward"),
+                ("nncore.layers.transformer", "FeedForward"),
+            ])
+            try:
+                self.ffn = _construct_ffn(
+                    FFNCls,
+                    d_model=d_model,
+                    d_ff=d_ff,
+                    dropout=dropout,
+                    bias=bias,
+                    activation=activation,
+                )
+            except Exception:
+                self.ffn = nn.Sequential(
+                    nn.Linear(d_model, d_ff, bias=bias),
+                    nn.GELU() if activation.lower() == "gelu" else nn.SiLU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(d_ff, d_model, bias=bias),
+                )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.ffn(x)

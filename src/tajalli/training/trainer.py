@@ -133,8 +133,10 @@ class Phase1Trainer:
                 gamma=config.get("lr_gamma", 0.1),
             )
         else:
-            lr_final = config.get("lr_final")
-            min_ratio = (lr_final / base_lr) if lr_final is not None else 0.0
+            min_ratio = config.get("min_lr_ratio")
+            if min_ratio is None:
+                lr_final = config.get("lr_final")
+                min_ratio = (lr_final / base_lr) if lr_final is not None else 0.0
             self.scheduler = get_cosine_warmup_scheduler(
                 self.optimizer,
                 warmup,

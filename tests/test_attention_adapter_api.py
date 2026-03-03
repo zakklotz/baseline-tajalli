@@ -25,4 +25,10 @@ def test_attention_adapter_returns_tuple_when_kv_requested():
     out, kv = y
     assert isinstance(out, torch.Tensor)
     assert out.shape == (2, 8, 64)
-    assert kv is None
+    # nn-core returns (k, v) when return_kv=True for recursive KV cache
+    assert kv is not None
+    assert isinstance(kv, tuple)
+    assert len(kv) == 2
+    k, v = kv
+    assert k.shape == (2, 8, 8, 8)
+    assert v.shape == (2, 8, 8, 8)

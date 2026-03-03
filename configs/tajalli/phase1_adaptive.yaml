@@ -1,0 +1,98 @@
+run_name: tajalli_phase1_adaptive
+
+# Training
+max_steps: 300000
+batch_size: 1
+gradient_accumulation_steps: 32
+lr: 6.0e-4
+lr_final: 1.0e-5
+lr_schedule: cosine_with_warmup
+warmup_steps: 1000
+optimizer: adamw
+weight_decay: 0.1
+grad_clip: 1.0
+
+# Train length
+eval_every: 2000
+checkpoint_every: 5000
+
+# Precision / device
+device: cuda
+dtype: bf16
+amp: true
+seed: 1337
+
+# Model dims
+d_model: 768
+d_essence: 1536
+n_heads: 12
+d_head: 64
+d_ff: 3072
+max_seq_len: 512
+
+# Recursion
+recursive_steps: 8
+n_steps: 8
+n_inner_layers: 3
+
+# Variable depth training
+variable_depth_training: true
+depth_warmup_steps: 30000
+depth_warmup_fixed: 6
+depth_curriculum:
+  - end_step: 10000
+    depth_min: 2
+    depth_max: 6
+  - end_step: 50000
+    depth_min: 6
+    depth_max: 12
+  - end_step: 300000
+    depth_min: 8
+    depth_max: 16
+
+# Essence
+essence_type: matrix
+n_essence_rows: 64
+essence_init: spectral
+
+# Regularizers
+lambda_gate_entropy: 0.1
+lambda_exit: 0.01
+
+# Exit router
+use_exit_router: true
+exit_threshold: 0.5
+exit_capacity_fraction: 0.5
+
+# Recursive KV cache
+use_recursive_kv_cache: true
+
+# Adaptive softmax
+use_adaptive_softmax: true
+freq_vocab_path: data/wikitext103_token_frequencies.json
+adaptive_softmax_cutoffs: [20000, 40000]
+adaptive_softmax_div_value: 4.0
+
+# Eval
+eval_use_memory: false
+eval_seg_len: 128
+eval_mem_len: 384
+
+# Data
+tokenizer_name: gpt2
+dataset: wikitext-103
+cache_dir: data/cache
+seq_len: 512
+num_workers: 4
+pin_memory: true
+
+# Depth families
+depth_families: 3
+family_steps: [0, 3, 6]
+
+# Alpha schedule
+alpha_schedule: [0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25]
+
+# Misc
+dropout: 0.0
+init_std: 0.02
