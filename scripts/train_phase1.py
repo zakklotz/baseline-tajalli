@@ -26,6 +26,13 @@ from tajalli.training.config_utils import (
     validate_phase1_config,
 )
 from tajalli.training.trainer import Phase1Trainer
+from tajalli.training.run_artifacts import (
+    count_parameters,
+    save_command,
+    save_git_commit,
+    save_model_stats,
+    save_resolved_config,
+)
 
 
 def load_yaml(path: str | Path) -> dict[str, Any]:
@@ -87,16 +94,27 @@ def preflight_phase1_config(
     return config, report, tokenizer, artifact
 
 
-def maybe_resume(trainer: Phase1Trainer, resume_path: str | None) -> int:
+def maybe_resume(trainer: Phase1Trainer, resume_path: str | None) -> dict[str, int | float] | None:
     if not resume_path:
-        return 0
+        return None
     ckpt = torch.load(resume_path, map_location="cpu")
     trainer.model.load_state_dict(ckpt["model"])
     trainer.optimizer.load_state_dict(ckpt["optimizer"])
     trainer.scheduler.load_state_dict(ckpt["scheduler"])
+    scaler_state = ckpt.get("scaler")
+    if scaler_state is not None and trainer.scaler is not None:
+        trainer.scaler.load_state_dict(scaler_state)
     step = int(ckpt.get("step", 0))
-    print(f"[resume] loaded checkpoint {resume_path} at step={step}")
-    return step
+    optimizer_step = int(ckpt.get("optimizer_step", step // max(1, trainer.grad_accum)))
+    best_val_ppl = float(ckpt.get("best_val_ppl", float("inf")))
+    print(f"[resume] loaded checkpoint {resume_path} at step={step} optimizer_step={optimizer_step}")
+    trainer_resume_state = {
+        "step": step,
+        "optimizer_step": optimizer_step,
+        "best_val_ppl": best_val_ppl,
+        "tokens_total": int(ckpt.get("tokens_total", 0)),
+    }
+    return trainer_resume_state
 
 
 def main() -> None:
@@ -182,10 +200,28 @@ def main() -> None:
         )
 
     run_name = cfg.get("run_name", "tajalli_phase1")
+    run_dir = Path(cfg.get("run_dir", Path("runs") / run_name))
     log_dir = Path(cfg.get("log_dir", "logs")) / run_name
     ckpt_dir = Path(cfg.get("checkpoint_dir", "checkpoints")) / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    save_resolved_config(cfg, run_dir)
+    save_command(run_dir)
+    save_git_commit(run_dir)
+
+    total_params, trainable_params = count_parameters(model)
+    model_stats = save_model_stats(
+        run_dir,
+        model_type="tajalli_phase1",
+        recursive=True,
+        recurrence_steps=int(cfg["n_steps"]),
+        total_params=total_params,
+        trainable_params=trainable_params,
+        effective_batch_size=int(cfg["batch_size"]) * int(cfg.get("gradient_accumulation_steps", 1)),
+    )
+    print(model_stats.strip(), flush=True)
 
     trainer = Phase1Trainer(
         model=model,
@@ -194,17 +230,23 @@ def main() -> None:
         config=cfg,
         log_dir=str(log_dir),
         checkpoint_dir=str(ckpt_dir),
+        run_dir=str(run_dir),
         model_name=run_name,
         essence_warmup_steps=cfg.get("essence_warmup_steps"),
     )
 
-    start_step = maybe_resume(trainer, resume_path)
+    start_state = maybe_resume(trainer, resume_path)
     max_steps = int(cfg["max_steps"])
-    if start_step >= max_steps:
-        print(f"[done] resume step {start_step} >= max_steps {max_steps}")
+    if start_state and int(start_state["step"]) >= max_steps:
+        print(f"[done] resume step {start_state['step']} >= max_steps {max_steps}")
         return
 
-    trainer.train()
+    trainer.train(
+        start_step=0 if start_state is None else int(start_state["step"]),
+        optimizer_step=0 if start_state is None else int(start_state["optimizer_step"]),
+        best_val_ppl=float("inf") if start_state is None else float(start_state["best_val_ppl"]),
+        tokens_total=0 if start_state is None else int(start_state["tokens_total"]),
+    )
 
 
 def _validate_adaptive_softmax_preflight(config: dict[str, Any], tokenizer) -> FreqArtifact:

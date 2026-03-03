@@ -1,8 +1,10 @@
 """Phase 1 and Phase 2 training loops with metrics logging."""
 
+import csv
 import math
 import os
 import random
+import time
 from pathlib import Path
 from typing import Optional, Any
 
@@ -84,6 +86,7 @@ class Phase1Trainer:
         config: dict,
         log_dir: str = "logs",
         checkpoint_dir: str = "checkpoints",
+        run_dir: str | None = None,
         model_name: str = "tajalli",
         essence_warmup_steps: Optional[int] = None,
     ):
@@ -148,8 +151,23 @@ class Phase1Trainer:
 
         Path(log_dir).mkdir(parents=True, exist_ok=True)
         Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
-        self.writer = SummaryWriter(os.path.join(log_dir, model_name))
+        self.writer = SummaryWriter(log_dir)
         self.checkpoint_dir = Path(checkpoint_dir)
+        self.run_dir = Path(run_dir) if run_dir is not None else self.checkpoint_dir
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+
+        self.train_log_path = self.run_dir / "train_log.csv"
+        self.eval_log_path = self.run_dir / "eval_log.csv"
+        self.train_log_f = self.train_log_path.open("a", encoding="utf-8", newline="")
+        self.train_log = csv.writer(self.train_log_f)
+        if self.train_log_path.stat().st_size == 0:
+            self.train_log.writerow(["step", "loss", "lr", "tokens_step", "tokens_total", "wall_time_sec", "depth_used"])
+            self.train_log_f.flush()
+        self.eval_log_f = self.eval_log_path.open("a", encoding="utf-8", newline="")
+        self.eval_log = csv.writer(self.eval_log_f)
+        if self.eval_log_path.stat().st_size == 0:
+            self.eval_log.writerow(["step", "val_perplexity", "val_loss", "eval_depth"])
+            self.eval_log_f.flush()
 
     def _get_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
         return torch.tril(
@@ -163,6 +181,7 @@ class Phase1Trainer:
     ) -> dict:
         input_ids = batch["input_ids"].to(self.device, non_blocking=True)
         labels = batch["labels"].to(self.device, non_blocking=True)
+        num_tokens = int((labels != -100).sum().item())
         seq_len = input_ids.shape[1]
         mask = self._get_causal_mask(seq_len, self.device)
 
@@ -247,7 +266,7 @@ class Phase1Trainer:
         if (step + 1) % self.grad_accum == 0:
             if self.scaler:
                 self.scaler.unscale_(self.optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(
+            torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), self.grad_clip
             )
             if self.scaler:
@@ -261,7 +280,12 @@ class Phase1Trainer:
             self.scheduler.step()
             self.optimizer.zero_grad()
 
-        result = {"loss": loss.item() * self.grad_accum}
+        result = {
+            "loss": loss.item() * self.grad_accum,
+            "_tokens": num_tokens,
+            "_optimizer_step_complete": (step + 1) % self.grad_accum == 0,
+            "_lr": float(self.optimizer.param_groups[0]["lr"]),
+        }
         if depth_used is not None:
             result["depth"] = depth_used
         if step_metrics:
@@ -359,20 +383,32 @@ class Phase1Trainer:
             result[k] = sum(v) / len(v)
         return result
 
-    def train(self):
+    def train(
+        self,
+        start_step: int = 0,
+        optimizer_step: int = 0,
+        best_val_ppl: float = float("inf"),
+        tokens_total: int = 0,
+    ):
         import math as _math
         self.model.train()
-        global_step = 0
-        best_val_ppl = float("inf")
+        global_step = int(start_step)
+        optimizer_step = int(optimizer_step)
+        best_val_ppl = float(best_val_ppl)
         self.optimizer.zero_grad()
         train_iter = iter(self.train_loader)
         _gate_status = "?"
+        tokens_total = int(tokens_total)
+        tokens_this_step = 0
+        step_start_time = None
         pbar = tqdm(
             total=self.max_steps,
             desc=f"{self.model_name}",
             unit="step",
             dynamic_ncols=True,
         )
+        if global_step > 0:
+            pbar.update(global_step)
 
         while global_step < self.max_steps:
             try:
@@ -389,10 +425,33 @@ class Phase1Trainer:
                     print(f"[{self.model_name}] Essence frozen at step {global_step}")
 
             metrics = self.train_step(batch, global_step)
+            tokens_total += int(metrics.get("_tokens", 0))
+            tokens_this_step += int(metrics.get("_tokens", 0))
+            if step_start_time is None:
+                step_start_time = time.time()
             if (global_step + 1) % self.grad_accum == 0:
+                optimizer_step += 1
                 for k, v in metrics.items():
                     if isinstance(v, (int, float)):
-                        self.writer.add_scalar(f"train/{k}", v, global_step)
+                        self.writer.add_scalar(f"train/{k}", v, optimizer_step)
+                wall_time_sec = 0.0
+                if step_start_time is not None:
+                    import time as _time
+                    wall_time_sec = _time.time() - step_start_time
+                self.train_log.writerow(
+                    [
+                        optimizer_step,
+                        f"{float(metrics.get('loss', 0.0)):.6f}",
+                        f"{float(metrics.get('_lr', self.optimizer.param_groups[0]['lr'])):.12g}",
+                        tokens_this_step,
+                        tokens_total,
+                        f"{wall_time_sec:.6f}",
+                        metrics.get("depth", ""),
+                    ]
+                )
+                self.train_log_f.flush()
+                tokens_this_step = 0
+                step_start_time = None
 
             # Update gate status every step; shown in pbar postfix
             _entropy_vals = [v for k, v in metrics.items() if k.endswith("attribute_gate_entropy") and isinstance(v, float)]
@@ -422,21 +481,31 @@ class Phase1Trainer:
                 eval_metrics = self.evaluate(n_steps=eval_n_steps)
                 for k, v in eval_metrics.items():
                     if isinstance(v, (int, float)):
-                        self.writer.add_scalar(f"val/{k}", v, global_step)
+                        self.writer.add_scalar(f"val/{k}", v, optimizer_step)
                     elif isinstance(v, torch.Tensor) and v.numel() == 1:
-                        self.writer.add_scalar(f"val/{k}", v.item(), global_step)
+                        self.writer.add_scalar(f"val/{k}", v.item(), optimizer_step)
+                self.eval_log.writerow(
+                    [
+                        optimizer_step,
+                        f"{float(eval_metrics['val_perplexity']):.6f}",
+                        f"{float(eval_metrics['val_loss']):.6f}",
+                        "" if eval_n_steps is None else eval_n_steps,
+                    ]
+                )
+                self.eval_log_f.flush()
                 if eval_metrics["val_perplexity"] < best_val_ppl:
                     best_val_ppl = eval_metrics["val_perplexity"]
-                    ckpt_path = self.checkpoint_dir / f"{self.model_name}_best.pt"
-                    self._save_checkpoint(ckpt_path, global_step)
+                    ckpt_path = self.checkpoint_dir / "best.pt"
+                    self._save_checkpoint(ckpt_path, global_step, optimizer_step, best_val_ppl, tokens_total)
                 print(
-                    f"[{self.model_name}] step {global_step} "
+                    f"[{self.model_name}] step {optimizer_step} "
                     f"val_ppl={eval_metrics['val_perplexity']:.2f}"
                 )
 
             if (global_step + 1) % self.ckpt_every == 0:
-                ckpt_path = self.checkpoint_dir / f"{self.model_name}_step{global_step}.pt"
-                self._save_checkpoint(ckpt_path, global_step)
+                ckpt_path = self.checkpoint_dir / f"step_{optimizer_step}.pt"
+                self._save_checkpoint(ckpt_path, global_step, optimizer_step, best_val_ppl, tokens_total)
+                self._save_checkpoint(self.checkpoint_dir / "last.pt", global_step, optimizer_step, best_val_ppl, tokens_total)
 
             global_step += 1
             pbar.update(1)
@@ -448,14 +517,29 @@ class Phase1Trainer:
             )
 
         pbar.close()
+        self._save_checkpoint(self.checkpoint_dir / "last.pt", global_step, optimizer_step, best_val_ppl, tokens_total)
         print(f"[{self.model_name}] Training complete. Best val_ppl={best_val_ppl:.2f}")
+        self.train_log_f.close()
+        self.eval_log_f.close()
+        self.writer.close()
 
-    def _save_checkpoint(self, path: Path, step: int):
+    def _save_checkpoint(
+        self,
+        path: Path,
+        step: int,
+        optimizer_step: int,
+        best_val_ppl: float,
+        tokens_total: int,
+    ):
         state = {
             "model": self.model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict(),
+            "scaler": self.scaler.state_dict() if self.scaler is not None else None,
             "step": step,
+            "optimizer_step": optimizer_step,
+            "best_val_ppl": best_val_ppl,
+            "tokens_total": tokens_total,
             "config": self.config,
         }
         torch.save(state, path)

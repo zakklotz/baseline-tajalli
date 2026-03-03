@@ -82,7 +82,7 @@ eval_mem_len: 384
 tokenizer_name: gpt2
 dataset: wikitext-103
 cache_dir: data/cache
-seq_len: 512
+seq_len: 2048
 num_workers: 4
 pin_memory: true
 
