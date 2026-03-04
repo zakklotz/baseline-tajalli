@@ -74,6 +74,7 @@ class TajalliLayer(nn.Module):
         depth_families: Optional[int] = None,
         family_steps: Optional[list[int]] = None,
         hypernetwork_attributes: bool = False,
+        attribute_gate_mode: Literal["contextual", "uniform"] = "contextual",
     ):
         super().__init__()
         self.d_model = d_model
@@ -82,6 +83,11 @@ class TajalliLayer(nn.Module):
         self.essence_type = essence_type
         self.n_essence_rows = n_essence_rows
         self.hypernetwork_attributes = hypernetwork_attributes
+        if attribute_gate_mode not in {"contextual", "uniform"}:
+            raise ValueError(
+                f"attribute_gate_mode must be 'contextual' or 'uniform', got {attribute_gate_mode!r}."
+            )
+        self.attribute_gate_mode = attribute_gate_mode
         self.depth_families = depth_families or 0
         self.step_to_family = _step_to_family_table(
             depth_families or 1,
@@ -186,7 +192,7 @@ class TajalliLayer(nn.Module):
                 E = essence.mean(dim=1) if essence.dim() == 3 else essence  # (B, d_essence)
             mod = self.hyper_net(E).view(-1, self.n_attributes, self.d_model)  # (B, n_attributes, d_model)
             attributes = [h_prev * mod[:, j:j+1, :] for j in range(self.n_attributes)]
-            gate_logits = self.gate(h_prev)
+            gate_logits = None if self.attribute_gate_mode == "uniform" else self.gate(h_prev)
         elif self.step_to_family is not None and self.attribute_heads_family is not None:
             family = self.step_to_family[step_idx_clamped]
             heads = self.attribute_heads_family[family]
@@ -198,7 +204,7 @@ class TajalliLayer(nn.Module):
                 B, T, _ = h_prev.shape
                 essence_expanded = essence.unsqueeze(1).expand(-1, T, -1)
                 attributes = [head(essence_expanded) for head in heads]
-            gate_logits = self.gate_family[family](h_prev)
+            gate_logits = None if self.attribute_gate_mode == "uniform" else self.gate_family[family](h_prev)
         else:
             if self.essence_type == "matrix":
                 attributes = [head(h_prev, essence) for head in self.attribute_heads]
@@ -208,8 +214,17 @@ class TajalliLayer(nn.Module):
                 B, T, _ = h_prev.shape
                 essence_expanded = essence.unsqueeze(1).expand(-1, T, -1)
                 attributes = [head(essence_expanded) for head in self.attribute_heads]
-            gate_logits = self.gate(h_prev)
-        gate_weights = F.softmax(gate_logits, dim=-1)
+            gate_logits = None if self.attribute_gate_mode == "uniform" else self.gate(h_prev)
+        if self.attribute_gate_mode == "uniform":
+            B, T, _ = h_prev.shape
+            gate_weights = torch.full(
+                (B, T, self.n_attributes),
+                1.0 / self.n_attributes,
+                device=h_prev.device,
+                dtype=h_prev.dtype,
+            )
+        else:
+            gate_weights = F.softmax(gate_logits, dim=-1)
         tajalli_signal = sum(
             g * a
             for g, a in zip(
@@ -262,21 +277,31 @@ class TajalliBlock(nn.Module):
         depth_families: Optional[int] = None,
         family_steps: Optional[list[int]] = None,
         hypernetwork_attributes: bool = False,
+        recurrence_mode: Literal["tajalli", "plain_recursive"] = "tajalli",
+        attribute_gate_mode: Literal["contextual", "uniform"] = "contextual",
     ):
         super().__init__()
-        self.tajalli_layer = TajalliLayer(
-            d_model,
-            d_essence,
-            n_attributes=n_attributes,
-            d_attr_hidden=d_attr_hidden,
-            nonlinear_gate=nonlinear_gate,
-            essence_type=essence_type,
-            n_essence_rows=n_essence_rows,
-            alpha_schedule=alpha_schedule,
-            depth_families=depth_families,
-            family_steps=family_steps,
-            hypernetwork_attributes=hypernetwork_attributes,
-        )
+        if recurrence_mode not in {"tajalli", "plain_recursive"}:
+            raise ValueError(
+                f"recurrence_mode must be 'tajalli' or 'plain_recursive', got {recurrence_mode!r}."
+            )
+        self.recurrence_mode = recurrence_mode
+        self.tajalli_layer = None
+        if recurrence_mode == "tajalli":
+            self.tajalli_layer = TajalliLayer(
+                d_model,
+                d_essence,
+                n_attributes=n_attributes,
+                d_attr_hidden=d_attr_hidden,
+                nonlinear_gate=nonlinear_gate,
+                essence_type=essence_type,
+                n_essence_rows=n_essence_rows,
+                alpha_schedule=alpha_schedule,
+                depth_families=depth_families,
+                family_steps=family_steps,
+                hypernetwork_attributes=hypernetwork_attributes,
+                attribute_gate_mode=attribute_gate_mode,
+            )
         self.attention = MultiHeadAttention(
             d_model, n_heads, d_head, dropout, max_seq_len
         )
@@ -328,7 +353,10 @@ class TajalliBlock(nn.Module):
             optional: (K, V) when return_kv and cached_kv was None
         """
         h_prev = h
-        tajalli_signal, tajalli_metrics = self.tajalli_layer(essence, h_prev, step_idx=step_idx)
+        tajalli_signal = None
+        tajalli_metrics: dict[str, object] = {}
+        if self.tajalli_layer is not None:
+            tajalli_signal, tajalli_metrics = self.tajalli_layer(essence, h_prev, step_idx=step_idx)
         attn_out = self.attention(
             h_prev, mask,
             memory_h=memory_h,
@@ -357,10 +385,13 @@ class TajalliBlock(nn.Module):
             moe_aux = None
             f_h = self.norm_ffn(f_h + self.ffn(f_h))
 
-        step_idx_clamped = min(step_idx, MAX_TAJALLI_STEPS - 1)
-        alpha = torch.sigmoid(self.tajalli_layer.alpha_per_step[step_idx_clamped])
-        # h_new = alpha * essence + (1-alpha) * transformer; alpha in [0,1] blends toward essence
-        h_new = alpha * tajalli_signal + (1 - alpha) * f_h
+        if self.tajalli_layer is not None and tajalli_signal is not None:
+            step_idx_clamped = min(step_idx, MAX_TAJALLI_STEPS - 1)
+            alpha = torch.sigmoid(self.tajalli_layer.alpha_per_step[step_idx_clamped])
+            # h_new = alpha * essence + (1-alpha) * transformer; alpha in [0,1] blends toward essence
+            h_new = alpha * tajalli_signal + (1 - alpha) * f_h
+        else:
+            h_new = f_h
 
         # Additional compute blocks per recursive step (n_inner_layers > 0)
         for inner_attn, inner_ffn, inner_norm_a, inner_norm_f in zip(
@@ -375,17 +406,18 @@ class TajalliBlock(nn.Module):
                     h_new.flatten(1), h_prev.flatten(1), dim=1
                 ).mean()
                 hidden_norm = h_new.norm(dim=-1).mean()
+            metrics = {
+                "drift_cosine_sim": drift_cos.item(),
+                "hidden_norm": hidden_norm.item(),
+                **tajalli_metrics,
+            }
+            if tajalli_signal is not None:
                 essence_anchoring = F.cosine_similarity(
                     h_new.flatten(1),
                     tajalli_signal.flatten(1),
                     dim=1,
                 ).mean()
-            metrics = {
-                "drift_cosine_sim": drift_cos.item(),
-                "hidden_norm": hidden_norm.item(),
-                "essence_anchoring": essence_anchoring.item(),
-                **tajalli_metrics,
-            }
+                metrics["essence_anchoring"] = essence_anchoring.item()
             if moe_aux is not None:
                 metrics["moe_aux"] = moe_aux
             if lawh_metrics is not None:
@@ -446,6 +478,8 @@ class TajalliStack(nn.Module):
         depth_families: Optional[int] = None,
         family_steps: Optional[list[int]] = None,
         hypernetwork_attributes: bool = False,
+        recurrence_mode: Literal["tajalli", "plain_recursive"] = "tajalli",
+        attribute_gate_mode: Literal["contextual", "uniform"] = "contextual",
     ):
         super().__init__()
         self.n_steps = n_steps
@@ -464,6 +498,8 @@ class TajalliStack(nn.Module):
             depth_families=depth_families,
             family_steps=family_steps,
             hypernetwork_attributes=hypernetwork_attributes,
+            recurrence_mode=recurrence_mode,
+            attribute_gate_mode=attribute_gate_mode,
         )
         moe_layer = None
         if use_moe:

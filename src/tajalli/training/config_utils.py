@@ -85,6 +85,12 @@ def normalize_phase1_config(
     if "tokenizer_name" not in config:
         config["tokenizer_name"] = "gpt2"
         report.defaults_applied.append("tokenizer_name <- 'gpt2'")
+    if "recurrence_mode" not in config:
+        config["recurrence_mode"] = "tajalli"
+        report.defaults_applied.append("recurrence_mode <- 'tajalli'")
+    if "attribute_gate_mode" not in config:
+        config["attribute_gate_mode"] = "contextual"
+        report.defaults_applied.append("attribute_gate_mode <- 'contextual'")
 
     _synchronize_step_aliases(config, report)
     return config, report
@@ -113,6 +119,18 @@ def validate_phase1_config(config: dict[str, Any]) -> None:
     run_name = config.get("run_name")
     if not run_name:
         raise ValueError("run_name is required for Phase 1 training.")
+
+    recurrence_mode = str(config.get("recurrence_mode", "tajalli"))
+    if recurrence_mode not in {"tajalli", "plain_recursive"}:
+        raise ValueError(
+            f"recurrence_mode must be one of ['tajalli', 'plain_recursive'], got {recurrence_mode!r}."
+        )
+
+    attribute_gate_mode = str(config.get("attribute_gate_mode", "contextual"))
+    if attribute_gate_mode not in {"contextual", "uniform"}:
+        raise ValueError(
+            f"attribute_gate_mode must be one of ['contextual', 'uniform'], got {attribute_gate_mode!r}."
+        )
 
     vocab_size = config.get("vocab_size")
     if vocab_size is not None and int(vocab_size) <= 0:
@@ -192,6 +210,8 @@ def print_training_config(config: dict, title: str = "TRAINING CONFIG") -> None:
         "grad_clip",
         "recursive_steps",
         "n_steps",
+        "recurrence_mode",
+        "attribute_gate_mode",
         "depth_min",
         "depth_max",
         "depth_steps",

@@ -46,6 +46,8 @@ class TajalliModelPhase1(nn.Module):
         depth_families: Optional[int] = None,
         family_steps: Optional[list] = None,
         hypernetwork_attributes: bool = False,
+        recurrence_mode: Literal["tajalli", "plain_recursive"] = "tajalli",
+        attribute_gate_mode: Literal["contextual", "uniform"] = "contextual",
         use_adaptive_softmax: bool = False,
         freq_vocab_path: Optional[str] = None,
         adaptive_softmax_cutoffs: Optional[list[int]] = None,
@@ -93,6 +95,8 @@ class TajalliModelPhase1(nn.Module):
             depth_families=depth_families,
             family_steps=family_steps,
             hypernetwork_attributes=hypernetwork_attributes,
+            recurrence_mode=recurrence_mode,
+            attribute_gate_mode=attribute_gate_mode,
         )
 
         self.adaptive_output = None

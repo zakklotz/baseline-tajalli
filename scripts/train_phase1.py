@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import yaml
@@ -25,7 +25,6 @@ from tajalli.training.config_utils import (
     print_training_config,
     validate_phase1_config,
 )
-from tajalli.training.trainer import Phase1Trainer
 from tajalli.training.run_artifacts import (
     count_parameters,
     save_command,
@@ -33,6 +32,9 @@ from tajalli.training.run_artifacts import (
     save_model_stats,
     save_resolved_config,
 )
+
+if TYPE_CHECKING:
+    from tajalli.training.trainer import Phase1Trainer
 
 
 def load_yaml(path: str | Path) -> dict[str, Any]:
@@ -94,7 +96,7 @@ def preflight_phase1_config(
     return config, report, tokenizer, artifact
 
 
-def maybe_resume(trainer: Phase1Trainer, resume_path: str | None) -> dict[str, int | float] | None:
+def maybe_resume(trainer: "Phase1Trainer", resume_path: str | None) -> dict[str, int | float] | None:
     if not resume_path:
         return None
     ckpt = torch.load(resume_path, map_location="cpu")
@@ -118,6 +120,8 @@ def maybe_resume(trainer: Phase1Trainer, resume_path: str | None) -> dict[str, i
 
 
 def main() -> None:
+    from tajalli.training.trainer import Phase1Trainer
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=str, required=True, help="YAML config path")
     ap.add_argument("--device", type=str, default=None, help="cuda|cpu (default: auto)")
@@ -175,6 +179,8 @@ def main() -> None:
         depth_families=cfg.get("depth_families", None),
         family_steps=cfg.get("family_steps", None),
         hypernetwork_attributes=bool(cfg.get("hypernetwork_attributes", False)),
+        recurrence_mode=str(cfg.get("recurrence_mode", "tajalli")),
+        attribute_gate_mode=str(cfg.get("attribute_gate_mode", "contextual")),
         use_adaptive_softmax=bool(cfg.get("use_adaptive_softmax", False)),
         freq_vocab_path=cfg.get("freq_vocab_path"),
         adaptive_softmax_cutoffs=cfg.get("adaptive_softmax_cutoffs"),
@@ -189,6 +195,7 @@ def main() -> None:
         _print_adaptive_softmax_banner(cfg, artifact)
     else:
         print("[adaptive-softmax] disabled")
+    _print_ablation_banner(cfg)
 
     resume_path = resolve_resume_path(cfg, args.resume)
 
@@ -289,6 +296,15 @@ def _print_adaptive_softmax_banner(config: dict[str, Any], artifact: FreqArtifac
         f"vocab_size={config['vocab_size']}, dataset={dataset.get('name')}/{dataset.get('split')}, "
         f"cutoffs={config.get('adaptive_softmax_cutoffs')})"
     )
+
+
+def _print_ablation_banner(config: dict[str, Any]) -> None:
+    recurrence_mode = str(config.get("recurrence_mode", "tajalli"))
+    attribute_gate_mode = str(config.get("attribute_gate_mode", "contextual"))
+    if recurrence_mode != "tajalli":
+        print(f"[ablation] recurrence_mode={recurrence_mode}")
+    if attribute_gate_mode != "contextual":
+        print(f"[ablation] attribute_gate_mode={attribute_gate_mode}")
 
 
 if __name__ == "__main__":
