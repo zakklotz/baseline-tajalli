@@ -91,6 +91,9 @@ def normalize_phase1_config(
     if "attribute_gate_mode" not in config:
         config["attribute_gate_mode"] = "contextual"
         report.defaults_applied.append("attribute_gate_mode <- 'contextual'")
+    if "init_mode" not in config:
+        config["init_mode"] = "deprecated"
+        report.defaults_applied.append("init_mode <- 'deprecated'")
 
     _synchronize_step_aliases(config, report)
     return config, report
@@ -130,6 +133,12 @@ def validate_phase1_config(config: dict[str, Any]) -> None:
     if attribute_gate_mode not in {"contextual", "uniform"}:
         raise ValueError(
             f"attribute_gate_mode must be one of ['contextual', 'uniform'], got {attribute_gate_mode!r}."
+        )
+
+    init_mode = str(config.get("init_mode", "deprecated"))
+    if init_mode not in {"deprecated", "tajalli_stable"}:
+        raise ValueError(
+            f"init_mode must be one of ['deprecated', 'tajalli_stable'], got {init_mode!r}."
         )
 
     vocab_size = config.get("vocab_size")
@@ -210,6 +219,7 @@ def print_training_config(config: dict, title: str = "TRAINING CONFIG") -> None:
         "grad_clip",
         "recursive_steps",
         "n_steps",
+        "init_mode",
         "recurrence_mode",
         "attribute_gate_mode",
         "depth_min",

@@ -56,7 +56,7 @@ class AdaptiveOutput(nn.Module):
         """
         ignore = target < 0
         if ignore.all():
-            return torch.zeros_like(target, dtype=hidden.dtype), torch.tensor(0.0, device=hidden.device)
+            return torch.zeros_like(target, dtype=hidden.dtype), hidden.new_zeros(())
         valid = ~ignore
         h_valid = hidden[valid]
         t_valid = target[valid].long()
@@ -64,9 +64,21 @@ class AdaptiveOutput(nn.Module):
         # Build full output for API compatibility
         output_full = torch.zeros(hidden.shape[0], device=hidden.device, dtype=hidden.dtype)
         output_full[valid] = out_asm.output
-        n_valid = valid.sum().item()
-        loss = out_asm.loss if n_valid > 0 else torch.tensor(0.0, device=hidden.device)
-        return output_full, loss
+        return output_full, out_asm.loss
+
+    def loss(
+        self,
+        hidden: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return only the scalar adaptive-softmax loss."""
+        ignore = target < 0
+        if ignore.all():
+            return hidden.new_zeros(())
+        valid = ~ignore
+        h_valid = hidden[valid]
+        t_valid = target[valid].long()
+        return self.asm(h_valid, t_valid).loss
 
     def log_prob(self, hidden: torch.Tensor) -> torch.Tensor:
         """(N, d_model) -> (N, vocab_size) log probabilities in frequency-sorted order."""

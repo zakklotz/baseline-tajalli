@@ -43,3 +43,4 @@ max_seq_len: 512
 essence_init: spectral
 essence_type: vector
 n_essence_rows: 64
+init_mode: deprecated

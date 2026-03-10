@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 
 import pytest
+import torch
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,7 +16,12 @@ if str(ROOT / "src") not in sys.path:
 
 pytest.importorskip("torch")
 
-from scripts.train_phase1 import preflight_phase1_config, resolve_resume_path
+from scripts.train_phase1 import (
+    maybe_initialize_model,
+    preflight_phase1_config,
+    resolve_init_mode,
+    resolve_resume_path,
+)
 from tajalli.data.dataloader import (
     get_wikitext103_tokenization_kwargs,
     get_wikitext103_tokenization_meta,
@@ -81,6 +87,7 @@ def test_normalize_phase1_deprecated_config() -> None:
     assert "hypernetwork_attributes" not in config
     assert config["recursive_steps"] == 8
     assert config["n_steps"] == 8
+    assert config["init_mode"] == "deprecated"
     assert config["essence_warmup_steps"] == 2000
     assert "essence" not in config
     assert "tajalli" not in config
@@ -126,6 +133,15 @@ def test_resume_path_precedence() -> None:
     config = {"resume_from": "from-config.pt"}
     assert resolve_resume_path(config, None) == "from-config.pt"
     assert resolve_resume_path(config, "from-cli.pt") == "from-cli.pt"
+
+
+def test_init_mode_precedence_and_validation() -> None:
+    config = {"init_mode": "deprecated"}
+    assert resolve_init_mode(config, None) == "deprecated"
+    assert resolve_init_mode(config, "tajalli_stable") == "tajalli_stable"
+
+    with pytest.raises(ValueError, match="init_mode"):
+        resolve_init_mode({}, "mystery-mode")
 
 
 def test_load_freq_artifact_supports_v0_v1_v2(tmp_path: Path) -> None:
@@ -235,6 +251,17 @@ def test_validate_phase1_config_rejects_invalid_cutoffs() -> None:
             }
         )
 
+    with pytest.raises(ValueError, match="init_mode"):
+        validate_phase1_config(
+            {
+                "run_name": "demo",
+                "tokenizer_name": "gpt2",
+                "n_steps": 8,
+                "recursive_steps": 8,
+                "init_mode": "mystery-mode",
+            }
+        )
+
 
 def test_preflight_accepts_v2_artifact_and_rejects_legacy_artifact(
     tmp_path: Path,
@@ -282,6 +309,54 @@ def test_preflight_accepts_v2_artifact_and_rejects_legacy_artifact(
 
     with pytest.raises(ValueError, match="schema v0"):
         preflight_phase1_config(config_path)
+
+
+def test_preflight_init_mode_cli_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    tok = make_fake_tokenizer()
+    monkeypatch.setattr("scripts.train_phase1.get_wikitext103_tokenizer", lambda _name: tok)
+
+    config_path = tmp_path / "config.yaml"
+    write_yaml(
+        config_path,
+        {
+            "run_name": "demo",
+            "tokenizer_name": tok.name_or_path,
+            "n_steps": 8,
+            "recursive_steps": 8,
+            "batch_size": 1,
+            "d_model": 16,
+            "d_essence": 16,
+            "n_heads": 2,
+            "d_head": 8,
+            "d_ff": 32,
+        },
+    )
+
+    config, _report, _tokenizer, _artifact = preflight_phase1_config(
+        config_path,
+        init_mode_override="tajalli_stable",
+    )
+    assert config["init_mode"] == "tajalli_stable"
+
+
+def test_maybe_initialize_model_respects_init_mode_and_resume(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[float, int]] = []
+
+    def fake_init(model, *, std: float, n_steps: int) -> None:
+        calls.append((std, n_steps))
+
+    monkeypatch.setattr("scripts.train_phase1.init_tajalli_weights", fake_init)
+    model = torch.nn.Linear(4, 4)
+    config = {"init_mode": "deprecated", "init_std": 0.02, "recursive_steps": 8}
+
+    maybe_initialize_model(model, config, resume_path=None)
+    assert calls == []
+
+    maybe_initialize_model(model, {**config, "init_mode": "tajalli_stable"}, resume_path="resume.pt")
+    assert calls == []
+
+    maybe_initialize_model(model, {**config, "init_mode": "tajalli_stable"}, resume_path=None)
+    assert calls == [(0.02, 8)]
 
 
 def test_shared_tokenization_contract_metadata_matches_kwargs() -> None:
@@ -336,3 +411,12 @@ def write_json(path: Path, payload: dict[str, object]) -> None:
 
 def write_yaml(path: Path, payload: dict[str, object]) -> None:
     path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+
+def test_active_baseline_source_has_no_jamba_surface() -> None:
+    src_root = ROOT / "src"
+    forbidden = ("use_jamba", "jamba_config")
+    for path in src_root.rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        for token in forbidden:
+            assert token not in text, f"Found {token!r} in active source file {path}"

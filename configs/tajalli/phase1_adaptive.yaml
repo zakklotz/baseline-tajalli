@@ -33,7 +33,7 @@ max_seq_len: 512
 # Recursion
 recursive_steps: 8
 n_steps: 8
-n_inner_layers: 3
+n_inner_layers: 0
 
 # Variable depth training
 variable_depth_training: true
@@ -95,4 +95,5 @@ alpha_schedule: [0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25]
 
 # Misc
 dropout: 0.0
+init_mode: deprecated
 init_std: 0.02

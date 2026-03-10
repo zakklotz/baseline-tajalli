@@ -10,7 +10,6 @@ def locate_baseline_root(repo_root: Path) -> Path:
     Locate the baseline-transformer repo root.
 
     Supported layouts:
-      - legacy: <repo_root>/.baseline-transformer
       - sibling: <repo_root>/../baseline-transformer
 
     Optional override:
@@ -22,10 +21,7 @@ def locate_baseline_root(repo_root: Path) -> Path:
         if (p / "src").exists() and (p / "configs").exists():
             return p.resolve()
 
-    cands = [
-        repo_root / ".baseline-transformer",
-        repo_root.parent / "baseline-transformer",
-    ]
+    cands = [repo_root.parent / "baseline-transformer"]
     for p in cands:
         if (p / "src").exists() and (p / "configs").exists():
             return p.resolve()

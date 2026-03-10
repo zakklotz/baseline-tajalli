@@ -51,10 +51,22 @@ def resolve_resume_path(config: dict[str, Any], cli_resume: str | None) -> str |
     return cli_resume if cli_resume is not None else config.get("resume_from")
 
 
+def resolve_init_mode(config: dict[str, Any], cli_init_mode: str | None) -> str:
+    """Prefer the CLI init mode; otherwise honor the normalized config."""
+    init_mode = cli_init_mode if cli_init_mode is not None else config.get("init_mode", "deprecated")
+    init_mode = str(init_mode)
+    if init_mode not in {"deprecated", "tajalli_stable"}:
+        raise ValueError(
+            f"init_mode must be one of ['deprecated', 'tajalli_stable'], got {init_mode!r}."
+        )
+    return init_mode
+
+
 def preflight_phase1_config(
     config_path: str | Path,
     *,
     device_override: str | None = None,
+    init_mode_override: str | None = None,
 ) -> tuple[dict[str, Any], NormalizationReport, Any, FreqArtifact | None]:
     """Normalize and validate the Phase 1 config before constructing the trainer."""
     raw_config = load_yaml(config_path)
@@ -62,6 +74,7 @@ def preflight_phase1_config(
 
     if device_override is not None:
         config["device"] = device_override
+    config["init_mode"] = resolve_init_mode(config, init_mode_override)
 
     apply_lawh_every_k(config)
 
@@ -119,6 +132,25 @@ def maybe_resume(trainer: "Phase1Trainer", resume_path: str | None) -> dict[str,
     return trainer_resume_state
 
 
+def maybe_initialize_model(model: torch.nn.Module, config: dict[str, Any], *, resume_path: str | None) -> None:
+    """Apply custom initialization only for fresh runs that explicitly opt into it."""
+    if resume_path is not None:
+        print("[init] skipped custom initialization because training is resuming")
+        return
+
+    init_mode = str(config.get("init_mode", "deprecated"))
+    if init_mode == "tajalli_stable":
+        print("[init] applying custom Tajalli stable initialization")
+        init_tajalli_weights(
+            model,
+            std=float(config.get("init_std", 0.02)),
+            n_steps=int(config["recursive_steps"]),
+        )
+        return
+
+    print("[init] using module default initialization (deprecated parity mode)")
+
+
 def main() -> None:
     from tajalli.training.trainer import Phase1Trainer
 
@@ -126,11 +158,19 @@ def main() -> None:
     ap.add_argument("--config", type=str, required=True, help="YAML config path")
     ap.add_argument("--device", type=str, default=None, help="cuda|cpu (default: auto)")
     ap.add_argument("--resume", type=str, default=None, help="Path to checkpoint .pt")
+    ap.add_argument(
+        "--init-mode",
+        type=str,
+        default=None,
+        choices=["deprecated", "tajalli_stable"],
+        help="Override Phase 1 initialization mode",
+    )
     args = ap.parse_args()
 
     cfg, report, _tokenizer, artifact = preflight_phase1_config(
         args.config,
         device_override=args.device,
+        init_mode_override=args.init_mode,
     )
 
     seed = int(cfg.get("seed", 1337))
@@ -198,13 +238,7 @@ def main() -> None:
     _print_ablation_banner(cfg)
 
     resume_path = resolve_resume_path(cfg, args.resume)
-
-    if resume_path is None:
-        init_tajalli_weights(
-            model,
-            std=float(cfg.get("init_std", 0.02)),
-            n_steps=int(cfg["recursive_steps"]),
-        )
+    maybe_initialize_model(model, cfg, resume_path=resume_path)
 
     run_name = cfg.get("run_name", "tajalli_phase1")
     run_dir = Path(cfg.get("run_dir", Path("runs") / run_name))

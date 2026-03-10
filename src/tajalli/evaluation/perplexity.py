@@ -5,6 +5,13 @@ import torch.nn as nn
 from tqdm import tqdm
 
 
+def _supports_return_hidden(model: torch.nn.Module) -> bool:
+    forward = getattr(model, "forward", None)
+    if forward is None or not hasattr(forward, "__code__"):
+        return False
+    return "return_hidden" in forward.__code__.co_varnames
+
+
 def compute_perplexity_with_memory(
     model: torch.nn.Module,
     dataloader,
@@ -52,7 +59,7 @@ def compute_perplexity_with_memory(
                 kw = dict(mask=mask, memory_h=memory_h, mem_pos_start=mem_pos_start)
                 if n_steps is not None:
                     kw["n_steps"] = n_steps
-                use_adaptive = getattr(model, "adaptive_output", None) is not None
+                use_adaptive = getattr(model, "adaptive_output", None) is not None and _supports_return_hidden(model)
                 if use_adaptive:
                     kw["return_hidden"] = True
                 try:
@@ -66,9 +73,10 @@ def compute_perplexity_with_memory(
                 out_t = out[0] if isinstance(out, tuple) else out
                 if use_adaptive:
                     from ..data.freq_vocab import labels_to_freq_rank
-                    h = out_t
-                    labels_ranked = labels_to_freq_rank(seg_labels.reshape(-1), model.orig_to_rank)
-                    _, loss_t = model.adaptive_output(h.view(-1, h.size(-1)), labels_ranked)
+                    rank_src = getattr(model, "rank_mapping", None)
+                    rank_src = rank_src if rank_src is not None else model.orig_to_rank
+                    labels_ranked = labels_to_freq_rank(seg_labels.reshape(-1), rank_src)
+                    loss_t = model.adaptive_output.loss(out_t.float().view(-1, out_t.size(-1)), labels_ranked)
                     n_valid = (seg_labels != -100).sum().item()
                     loss = loss_t * n_valid
                 else:
@@ -124,18 +132,31 @@ def compute_perplexity(
             kw = dict(mask=mask, **model_kwargs)
             if n_steps is not None:
                 kw["n_steps"] = n_steps
+            use_adaptive = getattr(model, "adaptive_output", None) is not None and _supports_return_hidden(model)
+            if use_adaptive:
+                kw["return_hidden"] = True
             try:
                 out = model(input_ids, **kw)
             except TypeError:
+                kw.pop("return_hidden", None)
                 out = model(input_ids, mask=mask)
+                use_adaptive = False
             logits = out[0] if isinstance(out, tuple) else out
 
-            loss = nn.functional.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                labels.view(-1),
-                ignore_index=-100,
-                reduction="sum",
-            )
+            if use_adaptive:
+                from ..data.freq_vocab import labels_to_freq_rank
+                rank_src = getattr(model, "rank_mapping", None)
+                rank_src = rank_src if rank_src is not None else model.orig_to_rank
+                labels_ranked = labels_to_freq_rank(labels.reshape(-1), rank_src)
+                loss = model.adaptive_output.loss(logits.float().view(-1, logits.size(-1)), labels_ranked)
+                loss = loss * (labels != -100).sum().item()
+            else:
+                loss = nn.functional.cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    labels.view(-1),
+                    ignore_index=-100,
+                    reduction="sum",
+                )
             n = (labels != -100).sum().item()
             total_loss += loss.item()
             n_tokens += n

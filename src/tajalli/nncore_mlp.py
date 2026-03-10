@@ -14,7 +14,7 @@ def _require_nncore():
         raise ImportError(
             "nn-core is not installed.\n"
             "Run:\n"
-            "  pip install -e ./.nn-core"
+            "  pip install -e ../nn-core"
         ) from e
 
 

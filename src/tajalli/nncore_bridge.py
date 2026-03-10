@@ -6,7 +6,7 @@ from typing import Any, Dict
 def _require_nncore():
     """
     Ensure nncore is importable. This repo expects nn-core to be installed locally:
-        pip install -e ./.nn-core
+        pip install -e ../nn-core
     """
     try:
         import nncore  # noqa: F401
@@ -14,7 +14,7 @@ def _require_nncore():
         raise ImportError(
             "nn-core is not installed or not importable.\n\n"
             "From the tajalli repo root, run:\n"
-            "  pip install -e ./.nn-core\n\n"
+            "  pip install -e ../nn-core\n\n"
             "Then install tajalli:\n"
             "  pip install -e .\n"
         ) from e

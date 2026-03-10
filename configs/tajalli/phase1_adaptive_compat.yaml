@@ -77,4 +77,5 @@ eval_mem_len: 384
 essence_init: spectral
 essence_type: matrix
 n_essence_rows: 64
+init_mode: deprecated
 init_std: 0.02

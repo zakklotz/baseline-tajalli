@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Literal, Optional
 
 from .essence import EssenceCore, EssenceCoreMatrix
-from .tajalli import TajalliStack
+from .tajalli import MetricMode, TajalliStack
 from .moe import N_EXPERTS  # Default n_experts; config can override
 from .adaptive_output import AdaptiveOutput
 from .lawh import LawhMemoryStore, LawhCrossAttention
@@ -14,6 +14,7 @@ from .exit_router import ExitRouter
 from .barzakh import BarzakhBottleneck
 from .qadr import QadrConstraints
 from tajalli.nncore_mlp import build_norm
+from tajalli.data.freq_vocab import load_freq_order, orig_to_rank_from_freq_order, rank_tensor_from_freq_order
 
 class TajalliModelPhase1(nn.Module):
     """
@@ -100,10 +101,9 @@ class TajalliModelPhase1(nn.Module):
         )
 
         self.adaptive_output = None
+        self.register_buffer("rank_mapping", None, persistent=False)
         self.orig_to_rank = None
         if use_adaptive_softmax and freq_vocab_path:
-            from tajalli.data.freq_vocab import load_freq_order, orig_to_rank_from_freq_order
-
             path = Path(freq_vocab_path)
             if path.exists():
                 freq_order = load_freq_order(path)
@@ -113,6 +113,7 @@ class TajalliModelPhase1(nn.Module):
                         f"must equal vocab_size ({vocab_size})."
                     )
                 self.orig_to_rank = orig_to_rank_from_freq_order(freq_order)
+                self.rank_mapping = rank_tensor_from_freq_order(freq_order)
                 cutoffs = [int(cutoff) for cutoff in (adaptive_softmax_cutoffs or [20000, 40000])]
                 if any(cutoff <= 0 for cutoff in cutoffs):
                     raise ValueError("adaptive_softmax_cutoffs must contain only positive integers.")
@@ -151,6 +152,7 @@ class TajalliModelPhase1(nn.Module):
         input_ids: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         return_step_metrics: bool = False,
+        metrics_mode: Optional[MetricMode] = None,
         n_steps: Optional[int] = None,
         return_hidden: bool = False,
         memory_h: Optional[torch.Tensor] = None,
@@ -171,9 +173,10 @@ class TajalliModelPhase1(nn.Module):
         B = input_ids.shape[0]
         h = self.embedding(input_ids)
         essence = self.essence(B)
+        resolved_metrics_mode: MetricMode = metrics_mode or ("full" if return_step_metrics else "none")
         h, step_metrics = self.tajalli_stack(
             h, essence, mask,
-            return_step_metrics=return_step_metrics,
+            metrics_mode=resolved_metrics_mode,
             n_steps_override=n_steps,
             memory_h=memory_h,
             mem_pos_start=mem_pos_start,
@@ -283,6 +286,7 @@ class TajalliModelPhase2(nn.Module):
         input_ids: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         return_step_metrics: bool = False,
+        metrics_mode: Optional[MetricMode] = None,
         n_steps: Optional[int] = None,
         global_step: Optional[int] = None,
         rescue_experts: Optional[list] = None,
@@ -294,9 +298,10 @@ class TajalliModelPhase2(nn.Module):
         B = input_ids.shape[0]
         h = self.embedding(input_ids)
         essence = self.essence(B)
+        resolved_metrics_mode: MetricMode = metrics_mode or ("full" if return_step_metrics else "none")
         h, step_metrics = self.tajalli_stack(
             h, essence, mask,
-            return_step_metrics=return_step_metrics,
+            metrics_mode=resolved_metrics_mode,
             n_steps_override=n_steps,
             memory_h=memory_h,
             mem_pos_start=mem_pos_start,
@@ -481,9 +486,6 @@ class TajalliModelPhase3(nn.Module):
         use_qadr: bool = False,
         qadr_repetition_penalty: float = 1.0,
         qadr_temperature: float = 1.0,
-        # Jamba (replaces block attention + MoE when True)
-        use_jamba: bool = False,
-        jamba_config: Optional[dict] = None,
         # Tajallī layer (e.g. nonlinear heads when resuming from phase2_nonlinear_heads)
         n_attributes: Optional[int] = None,
         d_attr_hidden: Optional[int] = None,
@@ -585,6 +587,7 @@ class TajalliModelPhase3(nn.Module):
         input_ids: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         return_step_metrics: bool = False,
+        metrics_mode: Optional[MetricMode] = None,
         n_steps: Optional[int] = None,
         lawh_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> tuple[torch.Tensor, Optional[dict]]:
@@ -606,9 +609,10 @@ class TajalliModelPhase3(nn.Module):
                 lawh_kv = self.lawh_store.get_keys_values(idx)
                 lawh_kv = (lawh_kv[0].to(h.device), lawh_kv[1].to(h.device))
 
+        resolved_metrics_mode: MetricMode = metrics_mode or ("full" if return_step_metrics else "none")
         h, step_metrics = self.tajalli_stack(
             h, essence, mask,
-            return_step_metrics=return_step_metrics,
+            metrics_mode=resolved_metrics_mode,
             n_steps_override=n_steps,
             lawh_kv=lawh_kv,
         )
@@ -617,9 +621,9 @@ class TajalliModelPhase3(nn.Module):
         # Output path in float32 so logits never overflow in fp16 (stack can produce large h)
         h = h.float()
         h = self.final_norm(h)
-        if step_metrics is None:
+        if step_metrics is None and resolved_metrics_mode != "none":
             step_metrics = {}
-        if self.training:
+        if self.training and resolved_metrics_mode != "none":
             step_metrics["barzakh_reconstruction_loss"] = torch.nn.functional.mse_loss(h_pre.float(), h)
         logits = torch.matmul(h, self.embedding.weight.t().float())
         if self.qadr is not None:
@@ -696,8 +700,6 @@ class TajalliModelPhase3(nn.Module):
             lawh_at_steps=config.get("lawh_at_steps", [0, -1]),
             d_barzakh=config.get("d_barzakh", 256),
             use_qadr=config.get("use_qadr", False),
-            use_jamba=config.get("use_jamba", False),
-            jamba_config=config.get("jamba_config"),
             n_attributes=tcfg.get("n_attributes"),
             d_attr_hidden=tcfg.get("d_attr_hidden"),
             nonlinear_gate=tcfg.get("nonlinear_gate", False),
@@ -732,30 +734,11 @@ class TajalliModelPhase3(nn.Module):
                     profile = [round(alphas_sigmoid[i], 3) for i in range(n_show)]
                     print(f"Loaded alpha_per_step from Phase 2 (step 0→{n_show - 1}): {profile}")
 
-        # When model has Jamba, copy old block.attention and block.moe_layer into jamba_block.attn / moe_layer
-        block = getattr(model.tajalli_stack, "block", None)
-        if block is not None and getattr(block, "jamba_block", None) is not None:
-            remap = {}
-            prefix_old = "tajalli_stack.block."
-            prefix_new = "tajalli_stack.block.jamba_block."
-            for key, value in state_dict.items():
-                if key.startswith(prefix_old + "attention."):
-                    remap[prefix_new + "attn." + key[len(prefix_old + "attention."):]] = value
-                elif key.startswith(prefix_old + "moe_layer."):
-                    remap[prefix_new + "moe_layer." + key[len(prefix_old + "moe_layer."):]] = value
-                elif key.startswith(prefix_old + "norm_attn."):
-                    remap[prefix_new + "norm_attn." + key[len(prefix_old + "norm_attn."):]] = value
-                elif key.startswith(prefix_old + "norm_ffn."):
-                    remap[prefix_new + "norm_ffn." + key[len(prefix_old + "norm_ffn."):]] = value
-            if remap:
-                model.load_state_dict(remap, strict=False)
-                print(f"Remapped {len(remap)} keys from old attention/MoE into Jamba block (SSM left randomly initialized).")
-
         if missing:
             for k in list(missing)[:10]:
                 if "lawh" in k or "barzakh" in k:
                     continue
-            # Expected missing: lawh_cross_attn.*, barzakh.*, jamba_block.ssm.* when loading old ckpt
+            # Expected missing: lawh_cross_attn.* and barzakh.* when loading old ckpt
         if freeze_essence:
             for p in model.essence.parameters():
                 p.requires_grad = False

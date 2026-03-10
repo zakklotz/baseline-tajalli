@@ -16,6 +16,7 @@ from tqdm import tqdm
 
 from .scheduler import get_cosine_warmup_scheduler, get_multistep_lr_scheduler
 from .losses import pair_orthogonality_loss, pair_coverage_loss
+from ..data.freq_vocab import labels_to_freq_rank
 from ..model.diverse_moe import DiverseAsmaaMoE, RandomAssignMoE, TwoPhaseMoE
 
 
@@ -73,6 +74,33 @@ def _get_curriculum_depth_range(step: int, config: dict) -> Optional[tuple[int, 
     if d_min is not None and d_max is not None:
         return (int(d_min), int(d_max))
     return None
+
+
+def _resolve_train_metrics_mode(step: int, *, log_every: int, needs_live_metrics: bool) -> str:
+    if (step + 1) % log_every == 0:
+        return "full"
+    return "minimal" if needs_live_metrics else "none"
+
+
+def _apply_regularization_terms(
+    loss: torch.Tensor,
+    *,
+    step_metrics: Optional[dict],
+    lambda_gate_entropy: float = 0.0,
+    lambda_exit: float = 0.0,
+    grad_accum: int = 1,
+) -> torch.Tensor:
+    if not step_metrics:
+        return loss
+    if lambda_gate_entropy > 0:
+        gate_ent_tensor = step_metrics.get("gate_entropy_loss")
+        if gate_ent_tensor is not None:
+            loss = loss - (lambda_gate_entropy * gate_ent_tensor) / grad_accum
+    if lambda_exit > 0:
+        exit_ent_tensor = step_metrics.get("_exit_entropy_tensor")
+        if exit_ent_tensor is not None:
+            loss = loss - (lambda_exit * exit_ent_tensor) / grad_accum
+    return loss
 
 
 class Phase1Trainer:
@@ -174,6 +202,46 @@ class Phase1Trainer:
             torch.ones(seq_len, seq_len, device=device)
         ).unsqueeze(0).unsqueeze(0)
 
+    def _model_supports_arg(self, arg: str) -> bool:
+        forward = getattr(self.model, "forward", None)
+        if forward is None or not hasattr(forward, "__code__"):
+            return False
+        return arg in forward.__code__.co_varnames
+
+    def _set_metrics_request(self, model_kw: dict[str, Any], metrics_mode: str) -> None:
+        if self._model_supports_arg("metrics_mode"):
+            model_kw["metrics_mode"] = metrics_mode
+        elif metrics_mode != "none":
+            model_kw["return_step_metrics"] = True
+
+    def _adaptive_softmax_loss(self, hidden: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        rank_src = getattr(self.model, "rank_mapping", None)
+        rank_src = rank_src if rank_src is not None else self.model.orig_to_rank
+        labels_ranked = labels_to_freq_rank(labels.reshape(-1), rank_src)
+        return self.model.adaptive_output.loss(hidden.float().view(-1, hidden.size(-1)), labels_ranked)
+
+    def _optimizer_step_total(self) -> int:
+        target = self.config.get("paper_target_optimizer_steps")
+        if target is not None:
+            return max(0, int(target))
+        return max(0, int(self.max_steps) // max(1, int(self.grad_accum)))
+
+    def _optimizer_accum_progress(self, step: int) -> str:
+        grad_accum = max(1, int(self.grad_accum))
+        return f"{(int(step) % grad_accum) + 1}/{grad_accum}"
+
+    def _build_train_progress_bar(self, *, optimizer_step: int = 0):
+        total = self._optimizer_step_total()
+        pbar = tqdm(
+            total=total,
+            desc=f"{self.model_name}",
+            unit="opt_step",
+            dynamic_ncols=True,
+        )
+        if optimizer_step > 0:
+            pbar.update(min(int(optimizer_step), total))
+        return pbar
+
     def train_step(
         self,
         batch: dict,
@@ -185,13 +253,14 @@ class Phase1Trainer:
         seq_len = input_ids.shape[1]
         mask = self._get_causal_mask(seq_len, self.device)
 
-        return_metrics = (
-            (step + 1) % self.log_every == 0 or self.lambda_gate_entropy > 0
-        ) and (
-            hasattr(self.model, "tajalli_stack") or hasattr(self.model, "block")
+        has_model_metrics = hasattr(self.model, "tajalli_stack") or hasattr(self.model, "block")
+        metrics_mode = _resolve_train_metrics_mode(
+            step,
+            log_every=self.log_every,
+            needs_live_metrics=has_model_metrics and (self.lambda_gate_entropy > 0 or self.lambda_exit > 0),
         )
-
-        model_kw = dict(mask=mask, return_step_metrics=return_metrics)
+        model_kw = dict(mask=mask)
+        self._set_metrics_request(model_kw, metrics_mode)
         depth_used = None
         if self.config.get("variable_depth_training") and hasattr(self.model, "tajalli_stack"):
             depth_warmup_steps = self.config.get("depth_warmup_steps", 0)
@@ -213,32 +282,29 @@ class Phase1Trainer:
             model_kw["n_steps"] = depth_used
 
         with torch.amp.autocast("cuda"):
-            use_adaptive = getattr(self.model, "adaptive_output", None) is not None
+            use_adaptive = (
+                getattr(self.model, "adaptive_output", None) is not None
+                and self._model_supports_arg("return_hidden")
+            )
             if use_adaptive:
                 model_kw["return_hidden"] = True
             try:
                 out = self.model(input_ids, **model_kw)
             except TypeError:
                 model_kw.pop("return_hidden", None)
+                model_kw.pop("metrics_mode", None)
                 out = self.model(input_ids, mask=mask)
-                return_metrics = False
+                metrics_mode = "none"
                 use_adaptive = False
 
             if isinstance(out, tuple):
-                out_t, step_metrics = out[0], out[1] if return_metrics else None
+                out_t, step_metrics = out[0], out[1]
             else:
                 out_t, step_metrics = out, None
 
         # CE in fp32 for numerical stability (fp16 logits can overflow)
         if use_adaptive:
-            from ..data.freq_vocab import labels_to_freq_rank
-            h = out_t
-            rank_src = getattr(self.model, "rank_mapping", None)
-            rank_src = rank_src if rank_src is not None else self.model.orig_to_rank
-            labels_ranked = labels_to_freq_rank(labels.view(-1), rank_src)
-            h_f32 = h.float()
-            _, loss_asm = self.model.adaptive_output(h_f32.view(-1, h.size(-1)), labels_ranked)
-            loss = loss_asm / self.grad_accum
+            loss = self._adaptive_softmax_loss(out_t, labels) / self.grad_accum
         else:
             logits = out_t
             logits_f32 = logits.float()
@@ -249,14 +315,13 @@ class Phase1Trainer:
             )
             loss = loss / self.grad_accum
 
-        if self.lambda_gate_entropy > 0 and step_metrics:
-            gate_ent_tensor = step_metrics.get("gate_entropy_loss")
-            if gate_ent_tensor is not None:
-                loss = loss - (self.lambda_gate_entropy * gate_ent_tensor) / self.grad_accum
-        if self.lambda_exit > 0 and step_metrics:
-            exit_ent_tensor = step_metrics.get("_exit_entropy_tensor")
-            if exit_ent_tensor is not None:
-                loss = loss - (self.lambda_exit * exit_ent_tensor) / self.grad_accum
+        loss = _apply_regularization_terms(
+            loss,
+            step_metrics=step_metrics,
+            lambda_gate_entropy=self.lambda_gate_entropy,
+            lambda_exit=self.lambda_exit,
+            grad_accum=self.grad_accum,
+        )
 
         if self.scaler:
             self.scaler.scale(loss).backward()
@@ -341,25 +406,18 @@ class Phase1Trainer:
                 use_adaptive = getattr(self.model, "adaptive_output", None) is not None and supports_return_hidden
                 if use_adaptive:
                     kw["return_hidden"] = True
+                if return_metrics:
+                    if "metrics_mode" in sig:
+                        kw["metrics_mode"] = "full"
+                    else:
+                        kw["return_step_metrics"] = True
 
                 with torch.amp.autocast("cuda"):
-                    if return_metrics:
-                        out, step_m = self.model(
-                            input_ids, mask=mask,
-                            return_step_metrics=True, **kw
-                        )
-                    else:
-                        out = self.model(input_ids, mask=mask, **kw)
-                        step_m = None
+                    out = self.model(input_ids, mask=mask, **kw)
+                    step_m = out[1] if return_metrics and isinstance(out, tuple) else None
                     out_t = out[0] if isinstance(out, tuple) else out
                     if use_adaptive:
-                        from ..data.freq_vocab import labels_to_freq_rank
-                        h = out_t
-                        rank_src = getattr(self.model, "rank_mapping", None)
-                        rank_src = rank_src if rank_src is not None else self.model.orig_to_rank
-                        labels_ranked = labels_to_freq_rank(labels.view(-1), rank_src)
-                        h_f32 = h.float()
-                        _, loss = self.model.adaptive_output(h_f32.view(-1, h.size(-1)), labels_ranked)
+                        loss = self._adaptive_softmax_loss(out_t, labels)
                     else:
                         logits = out_t
                         # CE in fp32 for numerical stability (fp16 logits can overflow)
@@ -401,14 +459,7 @@ class Phase1Trainer:
         tokens_total = int(tokens_total)
         tokens_this_step = 0
         step_start_time = None
-        pbar = tqdm(
-            total=self.max_steps,
-            desc=f"{self.model_name}",
-            unit="step",
-            dynamic_ncols=True,
-        )
-        if global_step > 0:
-            pbar.update(global_step)
+        pbar = self._build_train_progress_bar(optimizer_step=optimizer_step)
 
         while global_step < self.max_steps:
             try:
@@ -507,12 +558,16 @@ class Phase1Trainer:
                 self._save_checkpoint(ckpt_path, global_step, optimizer_step, best_val_ppl, tokens_total)
                 self._save_checkpoint(self.checkpoint_dir / "last.pt", global_step, optimizer_step, best_val_ppl, tokens_total)
 
+            optimizer_step_complete = (global_step + 1) % self.grad_accum == 0
+            accum_progress = self._optimizer_accum_progress(global_step)
             global_step += 1
-            pbar.update(1)
+            if optimizer_step_complete:
+                pbar.update(1)
             pbar.set_postfix(
                 loss=f"{metrics.get('loss', 0):.3f}",
                 best_ppl=f"{best_val_ppl:.2f}",
                 gate=_gate_status,
+                accum=accum_progress,
                 refresh=False,
             )
 
@@ -595,8 +650,9 @@ class Phase2Trainer(Phase1Trainer):
         seq_len = input_ids.shape[1]
         mask = self._get_causal_mask(seq_len, self.device)
 
-        return_metrics = True
-        model_kw = dict(mask=mask, return_step_metrics=return_metrics)
+        metrics_mode = _resolve_train_metrics_mode(step, log_every=self.log_every, needs_live_metrics=True)
+        model_kw = dict(mask=mask)
+        self._set_metrics_request(model_kw, metrics_mode)
         if self.config.get("variable_depth_training") and hasattr(self.model, "tajalli_stack"):
             depth_warmup_steps = self.config.get("depth_warmup_steps", 0)
             if depth_warmup_steps and step < depth_warmup_steps:
@@ -615,7 +671,10 @@ class Phase2Trainer(Phase1Trainer):
                         depth_max = self.config.get("depth_max", 8)
                         model_kw["n_steps"] = random.randint(depth_min, depth_max)
 
-        use_adaptive = getattr(self.model, "adaptive_output", None) is not None
+        use_adaptive = (
+            getattr(self.model, "adaptive_output", None) is not None
+            and self._model_supports_arg("return_hidden")
+        )
         if use_adaptive:
             model_kw["return_hidden"] = True
 
@@ -623,12 +682,7 @@ class Phase2Trainer(Phase1Trainer):
             out = self.model(input_ids, **model_kw)
             out_t, step_metrics = out[0], out[1]
             if use_adaptive:
-                from ..data.freq_vocab import labels_to_freq_rank
-                h = out_t
-                rank_src = getattr(self.model, "rank_mapping", None)
-                rank_src = rank_src if rank_src is not None else self.model.orig_to_rank
-                labels_ranked = labels_to_freq_rank(labels.view(-1), rank_src)
-                _, ce_loss = self.model.adaptive_output(h.view(-1, h.size(-1)), labels_ranked)
+                ce_loss = self._adaptive_softmax_loss(out_t, labels)
             else:
                 logits = out_t
                 ce_loss = nn.functional.cross_entropy(
@@ -650,14 +704,13 @@ class Phase2Trainer(Phase1Trainer):
                     cov = pair_coverage_loss(moe_aux["expert_indices"], num_experts=self.n_experts)
                     total_loss = total_loss + (scale * self.lambda_coverage * cov) / self.grad_accum
 
-            if self.lambda_gate_entropy > 0 and step_metrics:
-                gate_ent_tensor = step_metrics.get("gate_entropy_loss")
-                if gate_ent_tensor is not None:
-                    total_loss = total_loss - (self.lambda_gate_entropy * gate_ent_tensor) / self.grad_accum
-            if getattr(self, "lambda_exit", 0) > 0 and step_metrics:
-                exit_ent_tensor = step_metrics.get("_exit_entropy_tensor")
-                if exit_ent_tensor is not None:
-                    total_loss = total_loss - (self.lambda_exit * exit_ent_tensor) / self.grad_accum
+            total_loss = _apply_regularization_terms(
+                total_loss,
+                step_metrics=step_metrics,
+                lambda_gate_entropy=self.lambda_gate_entropy,
+                lambda_exit=getattr(self, "lambda_exit", 0),
+                grad_accum=self.grad_accum,
+            )
 
         if self.scaler:
             self.scaler.scale(total_loss).backward()
@@ -679,7 +732,10 @@ class Phase2Trainer(Phase1Trainer):
             self.scheduler.step()
             self.optimizer.zero_grad()
 
-        result = {"loss": ce_loss.item()}
+        result = {
+            "loss": ce_loss.item(),
+            "_optimizer_step_complete": (step + 1) % self.grad_accum == 0,
+        }
         if step_metrics:
             for k, v in step_metrics.items():
                 if k in ("moe_aux", "gate_entropy_loss", "_exit_entropy_tensor"):
@@ -725,27 +781,26 @@ class Phase2Trainer(Phase1Trainer):
         metrics_agg = {}
         last_moe_aux = None
         last_attribute_gate_mean = None
-        use_adaptive = getattr(self.model, "adaptive_output", None) is not None
+        use_adaptive = (
+            getattr(self.model, "adaptive_output", None) is not None
+            and self._model_supports_arg("return_hidden")
+        )
         with torch.no_grad():
             for batch in tqdm(self.val_loader, desc=f"Eval {self.model_name}", leave=False, unit="batch"):
                 input_ids = batch["input_ids"].to(self.device, non_blocking=True)
                 labels = batch["labels"].to(self.device, non_blocking=True)
                 seq_len = input_ids.shape[1]
                 mask = self._get_causal_mask(seq_len, self.device)
-                kw = dict(mask=mask, return_step_metrics=True)
+                kw = dict(mask=mask)
+                self._set_metrics_request(kw, "full")
                 if n_steps is not None:
                     kw["n_steps"] = n_steps
-                if use_adaptive:
+                if use_adaptive and self._model_supports_arg("return_hidden"):
                     kw["return_hidden"] = True
                 with torch.amp.autocast("cuda"):
                     out_t, step_m = self.model(input_ids, **kw)
                     if use_adaptive:
-                        from ..data.freq_vocab import labels_to_freq_rank
-                        h = out_t
-                        rank_src = getattr(self.model, "rank_mapping", None)
-                        rank_src = rank_src if rank_src is not None else self.model.orig_to_rank
-                        labels_ranked = labels_to_freq_rank(labels.view(-1), rank_src)
-                        _, loss = self.model.adaptive_output(h.view(-1, h.size(-1)), labels_ranked)
+                        loss = self._adaptive_softmax_loss(out_t, labels)
                     else:
                         logits = out_t
                         # CE in fp32 for numerical stability (fp16 logits can overflow)
@@ -790,7 +845,8 @@ class Phase2Trainer(Phase1Trainer):
         best_val_ppl = float("inf")
         self.optimizer.zero_grad()
         train_iter = iter(self.train_loader)
-        pbar = tqdm(total=self.max_steps, desc=self.model_name, unit="step", dynamic_ncols=True)
+        optimizer_step = 0
+        pbar = self._build_train_progress_bar(optimizer_step=optimizer_step)
 
         import math as _math
         _gate_status = "?"  # shown in pbar postfix every step
@@ -803,7 +859,9 @@ class Phase2Trainer(Phase1Trainer):
                 batch = next(train_iter)
 
             metrics = self.train_step(batch, global_step)
-            if (global_step + 1) % self.grad_accum == 0:
+            optimizer_step_complete = (global_step + 1) % self.grad_accum == 0
+            if optimizer_step_complete:
+                optimizer_step += 1
                 for k, v in metrics.items():
                     if k == "coactivation_matrix":
                         if (global_step + 1) % (self.log_every * 10) == 0 and v is not None:
@@ -869,9 +927,17 @@ class Phase2Trainer(Phase1Trainer):
                     for i in range(1, n_show):
                         self.writer.add_scalar(f"train/alpha_step_{i}", alpha_vals[i].item(), global_step)
                     pbar.write(f"Alpha profile (step 0→{n_show - 1}): {profile}")
+            accum_progress = self._optimizer_accum_progress(global_step)
             global_step += 1
-            pbar.update(1)
-            pbar.set_postfix(loss=f"{metrics.get('loss', 0):.3f}", best_ppl=f"{best_val_ppl:.2f}", gate=_gate_status, refresh=False)
+            if optimizer_step_complete:
+                pbar.update(1)
+            pbar.set_postfix(
+                loss=f"{metrics.get('loss', 0):.3f}",
+                best_ppl=f"{best_val_ppl:.2f}",
+                gate=_gate_status,
+                accum=accum_progress,
+                refresh=False,
+            )
         pbar.close()
         print(f"[{self.model_name}] Training complete. Best val_ppl={best_val_ppl:.2f}")
 
@@ -947,7 +1013,9 @@ class Phase2DiverseTrainer(Phase2Trainer):
             input_ids = batch["input_ids"].to(self.device, non_blocking=True)
             seq_len = input_ids.shape[1]
             mask = self._get_causal_mask(seq_len, self.device)
-            _ = self.model(input_ids, mask=mask, return_step_metrics=True)
+            infer_kw = dict(mask=mask)
+            self._set_metrics_request(infer_kw, "full")
+            _ = self.model(input_ids, **infer_kw)
             step_metrics = _[1]
         self.model.train()
         moe_aux = step_metrics.get("moe_aux") if step_metrics else None
@@ -972,8 +1040,9 @@ class Phase2DiverseTrainer(Phase2Trainer):
         seq_len = input_ids.shape[1]
         mask = self._get_causal_mask(seq_len, self.device)
 
-        return_metrics = True
-        model_kw = dict(mask=mask, return_step_metrics=return_metrics)
+        metrics_mode = _resolve_train_metrics_mode(step, log_every=self.log_every, needs_live_metrics=True)
+        model_kw = dict(mask=mask)
+        self._set_metrics_request(model_kw, metrics_mode)
         n_steps = None
         if self.config.get("variable_depth_training") and hasattr(self.model, "tajalli_stack"):
             depth_warmup_steps = self.config.get("depth_warmup_steps", 0)
@@ -1056,7 +1125,10 @@ class Phase2DiverseTrainer(Phase2Trainer):
             self.scheduler.step()
             self.optimizer.zero_grad()
 
-        result = {"loss": ce_loss.item()}
+        result = {
+            "loss": ce_loss.item(),
+            "_optimizer_step_complete": (step + 1) % self.grad_accum == 0,
+        }
         if n_steps is not None:
             result["depth"] = n_steps
         if step_metrics:
@@ -1157,7 +1229,8 @@ class Phase2DiverseTrainer(Phase2Trainer):
         best_val_ppl = float("inf")
         self.optimizer.zero_grad()
         train_iter = iter(self.train_loader)
-        pbar = tqdm(total=self.max_steps, desc=self.model_name, unit="step", dynamic_ncols=True)
+        optimizer_step = 0
+        pbar = self._build_train_progress_bar(optimizer_step=optimizer_step)
 
         while global_step < self.max_steps:
             try:
@@ -1173,7 +1246,9 @@ class Phase2DiverseTrainer(Phase2Trainer):
                 B, S = batch["input_ids"].shape[0], batch["input_ids"].shape[1]
                 depth_s = metrics.get("depth", "?")
                 print(f"Loss spike: loss={metrics['loss']:.3f} depth={depth_s} B={B} S={S}")
-            if (global_step + 1) % self.grad_accum == 0:
+            optimizer_step_complete = (global_step + 1) % self.grad_accum == 0
+            if optimizer_step_complete:
+                optimizer_step += 1
                 for k, v in metrics.items():
                     if k == "coactivation_matrix":
                         if (global_step + 1) % (self.log_every * 10) == 0 and v is not None:
@@ -1226,8 +1301,10 @@ class Phase2DiverseTrainer(Phase2Trainer):
             if (global_step + 1) % self.ckpt_every == 0:
                 self._save_checkpoint(self.checkpoint_dir / f"{self.model_name}_step{global_step}.pt", global_step)
 
+            accum_progress = self._optimizer_accum_progress(global_step)
             global_step += 1
-            pbar.update(1)
+            if optimizer_step_complete:
+                pbar.update(1)
             if global_step == 5000:
                 moe_for_check = getattr(getattr(self.model, "tajalli_stack", None), "block", None)
                 moe_for_check = getattr(moe_for_check, "moe_layer", None) if moe_for_check is not None else None
@@ -1281,6 +1358,7 @@ class Phase2DiverseTrainer(Phase2Trainer):
                 postfix["min_expert"] = f"{metrics['min_expert_share']:.2f}"
             if metrics.get("phase"):
                 postfix["phase"] = metrics["phase"]
+            postfix["accum"] = accum_progress
             pbar.set_postfix(**postfix, refresh=False)
         pbar.close()
         moe_final = getattr(getattr(self.model, "tajalli_stack", None), "block", None)
@@ -1324,8 +1402,9 @@ class Phase3Trainer(Phase2Trainer):
         seq_len = input_ids.shape[1]
         mask = self._get_causal_mask(seq_len, self.device)
 
-        return_metrics = True
-        model_kw = dict(mask=mask, return_step_metrics=return_metrics)
+        metrics_mode = _resolve_train_metrics_mode(step, log_every=self.log_every, needs_live_metrics=True)
+        model_kw = dict(mask=mask)
+        self._set_metrics_request(model_kw, metrics_mode)
         if self.config.get("variable_depth_training") and hasattr(self.model, "tajalli_stack"):
             depth_warmup_steps = self.config.get("depth_warmup_steps", 0)
             if depth_warmup_steps and step < depth_warmup_steps:
@@ -1371,14 +1450,13 @@ class Phase3Trainer(Phase2Trainer):
             if step_metrics and "barzakh_reconstruction_loss" in step_metrics:
                 total_loss = total_loss + (self.lambda_barzakh_recon * step_metrics["barzakh_reconstruction_loss"]) / self.grad_accum
 
-            if self.lambda_gate_entropy > 0 and step_metrics:
-                gate_ent_tensor = step_metrics.get("gate_entropy_loss")
-                if gate_ent_tensor is not None:
-                    total_loss = total_loss - (self.lambda_gate_entropy * gate_ent_tensor) / self.grad_accum
-            if getattr(self, "lambda_exit", 0) > 0 and step_metrics:
-                exit_ent_tensor = step_metrics.get("_exit_entropy_tensor")
-                if exit_ent_tensor is not None:
-                    total_loss = total_loss - (self.lambda_exit * exit_ent_tensor) / self.grad_accum
+            total_loss = _apply_regularization_terms(
+                total_loss,
+                step_metrics=step_metrics,
+                lambda_gate_entropy=self.lambda_gate_entropy,
+                lambda_exit=getattr(self, "lambda_exit", 0),
+                grad_accum=self.grad_accum,
+            )
 
         if self.scaler:
             self.scaler.scale(total_loss).backward()

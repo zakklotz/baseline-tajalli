@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
 N_ATTRIBUTES = 7
 MAX_TAJALLI_STEPS = 32
+MetricMode = Literal["none", "minimal", "full"]
 
 
 class AttributeHeadSimple(nn.Module):
@@ -168,11 +169,99 @@ class TajalliLayer(nn.Module):
                 init_values[i] = float(torch.logit(torch.tensor(p_clamped)))
         self.alpha_per_step = nn.Parameter(init_values.clone())
 
+    def _apply_batched_linear_heads(
+        self,
+        x: torch.Tensor,
+        heads: nn.ModuleList,
+    ) -> torch.Tensor:
+        """Project all per-attribute linear heads in one batched matmul."""
+        weight = torch.stack([head.weight for head in heads], dim=0)
+        out = torch.einsum("bti,aoi->btao", x, weight)
+        if heads[0].bias is not None:
+            bias = torch.stack([head.bias for head in heads], dim=0)
+            out = out + bias.unsqueeze(0).unsqueeze(0)
+        return out
+
+    def _apply_batched_mlp_heads(
+        self,
+        x: torch.Tensor,
+        heads: nn.ModuleList,
+    ) -> torch.Tensor:
+        """Fuse the standard Linear-GELU-Linear attribute MLP across attributes."""
+        w1 = torch.stack([head[0].weight for head in heads], dim=0)
+        h = torch.einsum("bti,ahi->btah", x, w1)
+        if heads[0][0].bias is not None:
+            b1 = torch.stack([head[0].bias for head in heads], dim=0)
+            h = h + b1.unsqueeze(0).unsqueeze(0)
+        h = F.gelu(h)
+        w2 = torch.stack([head[2].weight for head in heads], dim=0)
+        out = torch.einsum("btah,aoh->btao", h, w2)
+        if heads[0][2].bias is not None:
+            b2 = torch.stack([head[2].bias for head in heads], dim=0)
+            out = out + b2.unsqueeze(0).unsqueeze(0)
+        return out
+
+    def _compute_vector_attributes(
+        self,
+        heads: nn.ModuleList,
+        essence: torch.Tensor,
+        h_prev: torch.Tensor,
+    ) -> torch.Tensor:
+        if essence.dim() == 3:
+            essence = essence.mean(dim=1)
+        seq_len = h_prev.shape[1]
+        essence_expanded = essence.unsqueeze(1).expand(-1, seq_len, -1)
+        if all(isinstance(head, nn.Linear) for head in heads):
+            return self._apply_batched_linear_heads(essence_expanded, heads)
+        if all(
+            isinstance(head, nn.Sequential)
+            and len(head) == 3
+            and isinstance(head[0], nn.Linear)
+            and isinstance(head[1], nn.GELU)
+            and isinstance(head[2], nn.Linear)
+            for head in heads
+        ):
+            return self._apply_batched_mlp_heads(essence_expanded, heads)
+        return torch.stack([head(essence_expanded) for head in heads], dim=2)
+
+    def _compute_matrix_attributes(
+        self,
+        heads: nn.ModuleList,
+        essence: torch.Tensor,
+        h_prev: torch.Tensor,
+    ) -> torch.Tensor:
+        if all(isinstance(head, AttributeHeadSimple) for head in heads):
+            row_weight = torch.stack([head.row_weights.weight for head in heads], dim=0)
+            row_logits = torch.einsum("btd,ard->btar", h_prev, row_weight)
+            if heads[0].row_weights.bias is not None:
+                row_bias = torch.stack([head.row_weights.bias for head in heads], dim=0)
+                row_logits = row_logits + row_bias.unsqueeze(0).unsqueeze(0)
+            weights = F.softmax(row_logits, dim=-1)
+            combined = torch.einsum("btar,brd->btad", weights, essence)
+            out_weight = torch.stack([head.out_proj.weight for head in heads], dim=0)
+            out = torch.einsum("btad,aod->btao", combined, out_weight)
+            if heads[0].out_proj.bias is not None:
+                out_bias = torch.stack([head.out_proj.bias for head in heads], dim=0)
+                out = out + out_bias.unsqueeze(0).unsqueeze(0)
+            return out
+        return torch.stack([head(h_prev, essence) for head in heads], dim=2)
+
+    def _compute_attributes(
+        self,
+        heads: nn.ModuleList,
+        essence: torch.Tensor,
+        h_prev: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.essence_type == "matrix":
+            return self._compute_matrix_attributes(heads, essence, h_prev)
+        return self._compute_vector_attributes(heads, essence, h_prev)
+
     def forward(
         self,
         essence: torch.Tensor,
         h_prev: torch.Tensor,
         step_idx: int = 0,
+        metrics_mode: MetricMode = "full",
     ) -> tuple[torch.Tensor, dict]:
         """
         Args:
@@ -191,29 +280,15 @@ class TajalliLayer(nn.Module):
             else:
                 E = essence.mean(dim=1) if essence.dim() == 3 else essence  # (B, d_essence)
             mod = self.hyper_net(E).view(-1, self.n_attributes, self.d_model)  # (B, n_attributes, d_model)
-            attributes = [h_prev * mod[:, j:j+1, :] for j in range(self.n_attributes)]
+            attributes = h_prev.unsqueeze(2) * mod.unsqueeze(1)
             gate_logits = None if self.attribute_gate_mode == "uniform" else self.gate(h_prev)
         elif self.step_to_family is not None and self.attribute_heads_family is not None:
             family = self.step_to_family[step_idx_clamped]
             heads = self.attribute_heads_family[family]
-            if self.essence_type == "matrix":
-                attributes = [head(h_prev, essence) for head in heads]
-            else:
-                if essence.dim() == 3:
-                    essence = essence.mean(dim=1)
-                B, T, _ = h_prev.shape
-                essence_expanded = essence.unsqueeze(1).expand(-1, T, -1)
-                attributes = [head(essence_expanded) for head in heads]
+            attributes = self._compute_attributes(heads, essence, h_prev)
             gate_logits = None if self.attribute_gate_mode == "uniform" else self.gate_family[family](h_prev)
         else:
-            if self.essence_type == "matrix":
-                attributes = [head(h_prev, essence) for head in self.attribute_heads]
-            else:
-                if essence.dim() == 3:
-                    essence = essence.mean(dim=1)  # (B, d_essence)
-                B, T, _ = h_prev.shape
-                essence_expanded = essence.unsqueeze(1).expand(-1, T, -1)
-                attributes = [head(essence_expanded) for head in self.attribute_heads]
+            attributes = self._compute_attributes(self.attribute_heads, essence, h_prev)
             gate_logits = None if self.attribute_gate_mode == "uniform" else self.gate(h_prev)
         if self.attribute_gate_mode == "uniform":
             B, T, _ = h_prev.shape
@@ -225,24 +300,24 @@ class TajalliLayer(nn.Module):
             )
         else:
             gate_weights = F.softmax(gate_logits, dim=-1)
-        tajalli_signal = sum(
-            g * a
-            for g, a in zip(
-                gate_weights.split(1, dim=-1),
-                attributes,
-            )
-        )
+        tajalli_signal = (gate_weights.unsqueeze(-1) * attributes).sum(dim=2)
+        if metrics_mode == "none":
+            return tajalli_signal, {}
+
         gate_entropy = -(
             gate_weights * (gate_weights + 1e-10).log()
         ).sum(dim=-1).mean()
-        alpha = torch.sigmoid(self.alpha_per_step[step_idx_clamped])
-        metrics = {
-            "alpha_value": alpha.item(),
-            "alpha_step_idx": step_idx_clamped,
-            "attribute_gate_entropy": gate_entropy.item(),
-            "attribute_gate_mean": gate_weights.mean(dim=(0, 1)).detach().cpu(),
+        metrics: dict[str, object] = {
             "_gate_entropy_tensor": gate_entropy,  # live tensor for regularization loss
         }
+        if metrics_mode == "full":
+            alpha = torch.sigmoid(self.alpha_per_step[step_idx_clamped])
+            metrics.update({
+                "alpha_value": alpha.item(),
+                "alpha_step_idx": step_idx_clamped,
+                "attribute_gate_entropy": gate_entropy.item(),
+                "attribute_gate_mean": gate_weights.mean(dim=(0, 1)).detach().cpu(),
+            })
         return tajalli_signal, metrics
 
 
@@ -329,6 +404,7 @@ class TajalliBlock(nn.Module):
         essence: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         return_metrics: bool = False,
+        metrics_mode: Optional[MetricMode] = None,
         lawh_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         use_lawh_this_step: bool = False,
         step_idx: int = 0,
@@ -352,11 +428,17 @@ class TajalliBlock(nn.Module):
             metrics: if return_metrics, dict; else None
             optional: (K, V) when return_kv and cached_kv was None
         """
+        resolved_metrics_mode: MetricMode = metrics_mode or ("full" if return_metrics else "none")
         h_prev = h
         tajalli_signal = None
         tajalli_metrics: dict[str, object] = {}
         if self.tajalli_layer is not None:
-            tajalli_signal, tajalli_metrics = self.tajalli_layer(essence, h_prev, step_idx=step_idx)
+            tajalli_signal, tajalli_metrics = self.tajalli_layer(
+                essence,
+                h_prev,
+                step_idx=step_idx,
+                metrics_mode=resolved_metrics_mode,
+            )
         attn_out = self.attention(
             h_prev, mask,
             memory_h=memory_h,
@@ -373,13 +455,20 @@ class TajalliBlock(nn.Module):
         if use_lawh_this_step and self.lawh_cross_attn is not None and lawh_kv is not None:
             K_batch, V_batch = lawh_kv
             f_h, lawh_metrics = self.lawh_cross_attn(
-                f_h, K_batch, V_batch, return_metrics=return_metrics
+                f_h,
+                K_batch,
+                V_batch,
+                return_metrics=resolved_metrics_mode == "full",
             )
         else:
             lawh_metrics = None
 
         if self.moe_layer is not None:
-            moe_out, moe_aux = self.moe_layer(f_h, mask=mask, return_aux=return_metrics)
+            moe_out, moe_aux = self.moe_layer(
+                f_h,
+                mask=mask,
+                return_aux=resolved_metrics_mode != "none",
+            )
             f_h = self.norm_ffn(f_h + moe_out)
         else:
             moe_aux = None
@@ -400,7 +489,7 @@ class TajalliBlock(nn.Module):
             h_new = inner_norm_a(h_new + inner_attn(h_new, mask, memory_h=memory_h, mem_pos_start=mem_pos_start))
             h_new = inner_norm_f(h_new + inner_ffn(h_new))
 
-        if return_metrics:
+        if resolved_metrics_mode == "full":
             with torch.no_grad():
                 drift_cos = F.cosine_similarity(
                     h_new.flatten(1), h_prev.flatten(1), dim=1
@@ -425,6 +514,13 @@ class TajalliBlock(nn.Module):
             if kv_out is not None:
                 return h_new, metrics, kv_out
             return h_new, metrics
+        if resolved_metrics_mode == "minimal":
+            metrics = dict(tajalli_metrics)
+            if moe_aux is not None:
+                metrics["moe_aux"] = moe_aux
+            if kv_out is not None:
+                return h_new, metrics, kv_out
+            return h_new, metrics
         if kv_out is not None:
             return h_new, None, kv_out
         return h_new, None
@@ -445,7 +541,7 @@ def _resolve_lawh_at_steps(lawh_at_steps: Optional[List[int]], n_steps: int) -> 
 
 class TajalliStack(nn.Module):
     """
-    Applies TajalliBlock (or TajalliBlockV2 with Jamba) for N recursive steps. Shared weights.
+    Applies TajalliBlock for N recursive steps. Shared weights.
     h_0 = token_embeddings; h_t = block(h_{t-1}, essence)
     Lawḥ cross-attention runs only at steps in lawh_at_steps (e.g. first and last).
     """
@@ -525,6 +621,7 @@ class TajalliStack(nn.Module):
         essence: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         return_step_metrics: bool = False,
+        metrics_mode: Optional[MetricMode] = None,
         n_steps_override: Optional[int] = None,
         lawh_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         memory_h: Optional[torch.Tensor] = None,
@@ -541,8 +638,9 @@ class TajalliStack(nn.Module):
             h: (B, seq_len, d_model) after N steps
             step_metrics: per-step metrics; last step includes moe_aux with all_expert_outputs
         """
+        resolved_metrics_mode: MetricMode = metrics_mode or ("full" if return_step_metrics else "none")
         steps = n_steps_override if n_steps_override is not None else self.n_steps
-        step_metrics = {} if return_step_metrics else None
+        step_metrics = {} if resolved_metrics_mode != "none" else None
         last_moe_aux = None
         gate_entropy_tensors = []
         exit_entropy_tensors = []
@@ -558,12 +656,11 @@ class TajalliStack(nn.Module):
         for step in range(steps):
             # Collect metrics every step when return_step_metrics (for stability eval);
             # moe_aux is large so we only keep it from the last step.
-            return_m = return_step_metrics
             use_lawh = step in lawh_steps
             use_kv_cache = self.use_recursive_kv_cache and memory_h is None
             block_out = self.block(
                 h, essence, mask,
-                return_metrics=return_m,
+                metrics_mode=resolved_metrics_mode,
                 lawh_kv=lawh_kv,
                 use_lawh_this_step=use_lawh,
                 step_idx=step,
@@ -582,32 +679,33 @@ class TajalliStack(nn.Module):
                 # Write exited positions to output buffer; keep rest for next step
                 h_out = torch.where(exit_mask.expand_as(h_out), h, h_out)
                 exited_so_far = exited_so_far | exit_mask
-                # Binary entropy -mean(s*log(s)+(1-s)*log(1-s)) for L_exit (trainer subtracts lambda_exit * this)
-                s = scores.clamp(1e-7, 1.0 - 1e-7)
-                ent = -(s * s.log() + (1 - s) * (1 - s).log()).mean()
-                exit_entropy_tensors.append(ent)
+                if resolved_metrics_mode != "none":
+                    # Binary entropy -mean(s*log(s)+(1-s)*log(1-s)) for L_exit
+                    s = scores.clamp(1e-7, 1.0 - 1e-7)
+                    ent = -(s * s.log() + (1 - s) * (1 - s).log()).mean()
+                    exit_entropy_tensors.append(ent)
 
-            if return_m and m is not None:
+            if resolved_metrics_mode != "none" and m is not None:
                 for k, v in m.items():
                     if k == "moe_aux":
                         last_moe_aux = v
                     elif k == "_gate_entropy_tensor":
                         gate_entropy_tensors.append(v)  # keep live tensor for loss
-                    else:
+                    elif resolved_metrics_mode == "full":
                         step_metrics[f"step_{step}_{k}"] = v
 
         if use_exit_router:
             h_out = torch.where(~exited_so_far.expand_as(h_out), h, h_out)
             h = h_out
-            if exit_entropy_tensors:
+            if exit_entropy_tensors and step_metrics is not None:
                 step_metrics = step_metrics if step_metrics is not None else {}
                 step_metrics["_exit_entropy_tensor"] = sum(exit_entropy_tensors) / len(exit_entropy_tensors)
 
         # MoE aux (expert indices, etc.) only from last step to avoid large tensors
-        if return_step_metrics and last_moe_aux is not None:
+        if resolved_metrics_mode != "none" and last_moe_aux is not None and step_metrics is not None:
             step_metrics["moe_aux"] = last_moe_aux
         # Sum gate entropy tensors across all recursive steps for regularization loss
-        if gate_entropy_tensors:
+        if gate_entropy_tensors and step_metrics is not None:
             step_metrics["gate_entropy_loss"] = sum(gate_entropy_tensors) / len(gate_entropy_tensors)
 
         return h, step_metrics
